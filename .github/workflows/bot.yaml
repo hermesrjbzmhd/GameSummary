@@ -2,8 +2,8 @@ name: Game Summary Bot
 
 on:
   schedule:
-    - cron: '*/30 * * * *'  # اجرا هر ۳۰ دقیقه
-  workflow_dispatch:        # امکان اجرای دستی
+    - cron: '*/30 * * * *'  # اجرای خودکار هر ۳۰ دقیقه یک‌بار
+  workflow_dispatch:        # امکان اجرای دستی با یک کلیک از تب Actions
 
 permissions:
   contents: write
@@ -21,11 +21,9 @@ jobs:
         with:
           python-version: '3.10'
 
-      # مرحله جدید: نصب ابزار فشرده‌سازی ffmpeg
-      - name: Install FFmpeg
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+      # لود کردن سریع FFmpeg و ffprobe در عرض ۱ ثانیه
+      - name: Setup FFmpeg
+        uses: FedericoCarboni/setup-ffmpeg@v3
 
       - name: Install dependencies
         run: |

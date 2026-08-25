@@ -13,6 +13,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "-100xxxxxxxxxx")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "3600"))
 PORT = int(os.getenv("PORT", 8000))
+MAX_VIDEOS_PER_RUN = 3  # Process maximum 3 videos per run to prevent timeout
 
 TEAMS_FILE = os.getenv("TEAMS_FILE", "teams.txt")
 HISTORY_FILE = os.getenv("HISTORY_FILE", "sent_videos.json")
@@ -74,7 +75,6 @@ def clean_title(link_tag):
         else:
             raw_title = link_tag.get_text(" ", strip=True)
 
-    # Split on 'خلاصه' if repeated in the text
     parts = re.split(r'(?=خلاصه)', raw_title)
     if len(parts) > 1 and parts[0].strip():
         raw_title = parts[0].strip()
@@ -82,6 +82,7 @@ def clean_title(link_tag):
         raw_title = parts[1].strip()
 
     return re.sub(r'\s+', ' ', raw_title).strip()
+
 
 def load_target_teams():
     """Loads monitored team names from teams.txt."""
@@ -153,7 +154,7 @@ def extract_all_mp4_qualities(page_url):
     qualities_dict = {}
 
     try:
-        res = requests.get(page_url, headers=HEADERS, timeout=15)
+        res = requests.get(page_url, headers=HEADERS, timeout=12)
         if res.status_code != 200:
             print(f"[-] Failed to fetch page. HTTP Code: {res.status_code}")
             return {}
@@ -208,7 +209,7 @@ def build_caption(title, qualities_dict, page_url, quality_label=""):
     """Builds formatted Telegram HTML caption with direct download links."""
     lines = [f"⚽️ <b>{title}</b>"]
     if quality_label:
-        lines.append(f"🎬 <b>Playing Quality:</b> {quality_label}\n")
+        lines.append(f"🎬 <b>Quality:</b> {quality_label}\n")
     else:
         lines.append("")
 
@@ -223,9 +224,9 @@ def build_caption(title, qualities_dict, page_url, quality_label=""):
 
 
 def get_stream_file_size_mb(url):
-    """Quickly checks file size via HEAD or stream request header."""
+    """Quickly checks file size via HEAD request."""
     try:
-        r = requests.head(url, headers=HEADERS, timeout=8, allow_redirects=True)
+        r = requests.head(url, headers=HEADERS, timeout=6, allow_redirects=True)
         length = r.headers.get("content-length")
         if length:
             return int(length) / (1024 * 1024)
@@ -235,7 +236,7 @@ def get_stream_file_size_mb(url):
 
 
 def get_video_duration_seconds(input_path):
-    """Gets the exact duration of the video in seconds using ffprobe."""
+    """Gets duration in seconds using ffprobe with a strict 15s timeout."""
     try:
         cmd = [
             "ffprobe", "-v", "error",
@@ -243,33 +244,24 @@ def get_video_duration_seconds(input_path):
             "-of", "default=noprint_wrappers=1:nokey=1",
             input_path
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=True)
         return float(res.stdout.strip())
-    except Exception as e:
-        print(f"[-] Could not get video duration via ffprobe: {e}")
+    except Exception:
         return None
 
 
 def fast_compress_video(input_path, output_path, target_mb=45.0):
-    """
-    Mathematically calculates target bitrate based on exact video duration
-    to guarantee output file size is strictly between 40MB and 47MB.
-    """
+    """Calculates optimal bitrate and compresses video with a strict 120s timeout."""
     try:
         duration = get_video_duration_seconds(input_path)
 
         if duration and duration > 0:
-            print(f"[*] Detected video duration: {duration:.1f} seconds ({duration/60:.1f} minutes)")
-            
-            # Target size: 44 MB = 44 * 8192 kilobits
+            print(f"[*] Video duration: {duration:.1f}s ({duration/60:.1f} min)")
             target_total_kbits = target_mb * 8192
             audio_bitrate_kbps = 64
-            
-            # Calculate optimal video bitrate
             target_video_kbps = int((target_total_kbits / duration) - audio_bitrate_kbps)
-            target_video_kbps = max(250, min(target_video_kbps, 2000))  # Clamp between 250k and 2000k
-            
-            print(f"[*] Calculated optimal video bitrate: {target_video_kbps} kbps")
+            target_video_kbps = max(250, min(target_video_kbps, 1600))
+            print(f"[*] Compressing with target video bitrate: {target_video_kbps} kbps")
 
             cmd = [
                 "ffmpeg", "-y", "-i", input_path,
@@ -278,49 +270,50 @@ def fast_compress_video(input_path, output_path, target_mb=45.0):
                 "-b:v", f"{target_video_kbps}k",
                 "-maxrate", f"{int(target_video_kbps * 1.2)}k",
                 "-bufsize", f"{int(target_video_kbps * 2)}k",
-                "-preset", "veryfast",
+                "-preset", "ultrafast",
+                "-threads", "0",
                 "-c:a", "aac",
                 "-b:a", f"{audio_bitrate_kbps}k",
                 "-movflags", "+faststart",
                 output_path
             ]
         else:
-            # Fallback CRF mode if duration detection fails
-            print("[*] Using adaptive fallback compression...")
+            print("[*] Using CRF 32 compression mode...")
             cmd = [
                 "ffmpeg", "-y", "-i", input_path,
-                "-vf", "scale=-2:min(720\\,ih)",
+                "-vf", "scale=-2:480",
                 "-c:v", "libx264", "-crf", "32",
-                "-preset", "veryfast",
+                "-preset", "ultrafast",
+                "-threads", "0",
                 "-c:a", "aac", "-b:a", "64k",
                 "-movflags", "+faststart",
                 output_path
             ]
 
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        # 120-second timeout prevents any hang
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120, check=True)
 
         if os.path.exists(output_path):
             final_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-            print(f"[✓] Compression successful! Output size: {final_size_mb:.2f} MB")
+            print(f"[✓] Compression finished! Result size: {final_size_mb:.2f} MB")
             return final_size_mb <= 49.0
 
+    except subprocess.TimeoutExpired:
+        print("[-] FFmpeg compression timed out after 120s.")
+        return False
     except Exception as e:
-        print(f"[-] Video compression failed: {e}")
+        print(f"[-] Compression error: {e}")
         return False
 
     return False
 
+
 def upload_video_file_to_telegram(qualities_dict, title, page_url):
-    """
-    Selects the optimal stream, compresses only if necessary,
-    and uploads playable video directly to Telegram.
-    """
+    """Selects best stream, compresses if needed, and uploads to Telegram."""
     api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
 
-    # Step 1: Probe sizes of streams to pick the best candidate
     ready_direct_url = None
     ready_direct_label = None
-
     compress_candidate_url = None
     compress_candidate_label = None
     smallest_size_above_50 = 9999
@@ -328,7 +321,7 @@ def upload_video_file_to_telegram(qualities_dict, title, page_url):
     for label, url in qualities_dict.items():
         size_mb = get_stream_file_size_mb(url)
         if size_mb:
-            print(f"[*] Stream [{label}] size: {size_mb:.2f} MB")
+            print(f"[*] Stream [{label}] probe size: {size_mb:.2f} MB")
             if size_mb <= 49.0:
                 if not ready_direct_url or "720" in label:
                     ready_direct_url = url
@@ -339,18 +332,15 @@ def upload_video_file_to_telegram(qualities_dict, title, page_url):
                     compress_candidate_url = url
                     compress_candidate_label = label
 
-    # If an existing stream is already <= 49MB, use it directly (Ultra Fast!)
     if ready_direct_url:
         selected_url = ready_direct_url
         selected_label = ready_direct_label
         needs_compression = False
     elif compress_candidate_url:
-        # Use the smallest stream > 50MB for faster download and compression
         selected_url = compress_candidate_url
         selected_label = compress_candidate_label
         needs_compression = True
     else:
-        # Fallback to first available quality
         selected_label, selected_url = list(qualities_dict.items())[0]
         needs_compression = True
 
@@ -358,7 +348,8 @@ def upload_video_file_to_telegram(qualities_dict, title, page_url):
     final_upload_file = f"final_{int(time.time())}.mp4"
 
     try:
-        print(f"[*] Downloading selected stream [{selected_label}]: {selected_url}")
+        print(f"[*] Downloading stream [{selected_label}]...")
+        # 60s timeout for download
         with requests.get(selected_url, headers=HEADERS, stream=True, timeout=60) as r:
             r.raise_for_status()
             with open(raw_temp_file, "wb") as f:
@@ -452,6 +443,10 @@ def process_varzesh3():
         found_new = 0
 
         for link in links:
+            if found_new >= MAX_VIDEOS_PER_RUN:
+                print(f"[*] Reached limit of {MAX_VIDEOS_PER_RUN} videos per run. Remaining will process next cycle.")
+                break
+
             href = link["href"]
             title = clean_title(link)
 
