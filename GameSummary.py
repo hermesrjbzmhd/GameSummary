@@ -242,14 +242,15 @@ def process_varzesh3():
         found_new = 0
 
         for link in links:
-            href = link["href"]
+            href = link.get("href", "")
+            href_value = href[0] if isinstance(href, list) else str(href)
             title = link.get_text(strip=True)
 
-            if "/video/" in href and title:
+            if "/video/" in href_value and title:
                 is_matched, matched_team = is_matching_team(title, target_teams)
 
                 if is_matched:
-                    full_page_url = href if href.startswith("http") else f"https://video.varzesh3.com{href}"
+                    full_page_url = href_value if href_value.startswith("http") else f"https://video.varzesh3.com{href_value}"
 
                     if full_page_url not in sent_videos:
                         print(f"\n[+] Found new highlight for '{matched_team}': {title}")
@@ -279,12 +280,15 @@ if __name__ == "__main__":
     if not validate_config():
         exit(1)
 
-    # Start health check server in a background daemon thread
-    threading.Thread(target=run_health_check_server, daemon=True).start()
-    print(f"[*] Health check server active on port {PORT}.")
-    print("=== Varzesh3 Highlights Bot started successfully ===")
-
-    while True:
+    # اگر روی GitHub Actions باشد، یک‌بار اجرا شده و خارج می‌شود
+    if os.getenv("RUN_ONCE") == "true":
+        print("=== Running in Single-Execution Mode (GitHub Actions) ===")
         process_varzesh3()
-        print(f"[*] Sleeping for {CHECK_INTERVAL // 60} minutes...\n")
-        time.sleep(CHECK_INTERVAL)
+    else:
+        # حالت حلقه مداوم برای سیستم محلی
+        threading.Thread(target=run_health_check_server, daemon=True).start()
+        print("=== Varzesh3 Highlights Bot started successfully ===")
+        while True:
+            process_varzesh3()
+            print(f"[*] Sleeping for {CHECK_INTERVAL // 60} minutes...\n")
+            time.sleep(CHECK_INTERVAL)
