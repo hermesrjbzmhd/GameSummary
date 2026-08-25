@@ -29,7 +29,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"Varzesh3 Highlights Bot is running!")
+        self.wfile.write(b"Bot is healthy and running!")
 
     def log_message(self, format, *args):
         return
@@ -112,14 +112,9 @@ def is_matching_team(title, allowed_teams):
 
 
 def clean_url(raw_url):
-    """
-    Cleans up escaped characters, handles JSON slashes, and enforces HTTPS.
-    Fixes broken links caused by '\\/' JSON escaping.
-    """
+    """Cleans up escaped characters and forces valid HTTPS URL."""
     if not raw_url:
         return ""
-    
-    # Unescape JSON slashes and HTML entities
     url = raw_url.replace(r"\/", "/").replace("\\/", "/").replace("&amp;", "&")
     url = url.strip().strip('"').strip("'").strip(";").strip("\\")
 
@@ -134,10 +129,7 @@ def clean_url(raw_url):
 
 
 def extract_all_mp4_qualities(page_url):
-    """
-    Scrapes the video detail page, finds all valid MP4 streams (HD and SD),
-    cleans all URLs, and categorizes them by resolution.
-    """
+    """Scrapes the video detail page and extracts all available resolutions."""
     qualities_dict = {}
 
     try:
@@ -149,48 +141,41 @@ def extract_all_mp4_qualities(page_url):
         soup = BeautifulSoup(res.text, "html.parser")
         raw_matches = set()
 
-        # 1. Look for anchor download links
         for a in soup.find_all("a", href=True):
             href = a["href"]
             if ".mp4" in href.lower():
                 raw_matches.add((clean_url(href), a.get_text(strip=True)))
 
-        # 2. Look for HTML5 <video> and <source> tags
         for tag in soup.find_all(["source", "video"]):
             src = tag.get("src")
             if src and ".mp4" in src.lower():
                 raw_matches.add((clean_url(src), tag.get("label", "")))
 
-        # 3. Search raw HTML / Javascript / JSON blocks for MP4 links
-        # Match both standard URLs and escaped JSON URLs
         regex_matches = re.findall(r'https?(?::|\\/|/)+[^\s"\'<>]+\.mp4[^\s"\'<>]*', res.text)
         for r_url in regex_matches:
             raw_matches.add((clean_url(r_url), ""))
 
-        # Categorize into clean resolution labels
         for url, text in raw_matches:
             if not url or ".mp4" not in url.lower():
                 continue
 
             combined_str = f"{url.lower()} {text.lower()}"
 
-            # Original HD Video file (Varzesh3 uses /videos/ for master high quality)
-            if "/videos/" in url and "/videos-quality/" not in url:
-                if "720p HD (Original)" not in qualities_dict:
-                    qualities_dict["720p HD (Original)"] = url
-            elif ("1080" in combined_str or "fhd" in combined_str) and "1080p FHD" not in qualities_dict:
-                qualities_dict["1080p FHD"] = url
-            elif ("720" in combined_str or "hd" in combined_str) and "720p HD" not in qualities_dict:
-                qualities_dict["720p HD"] = url
-            elif ("480" in combined_str or "sd" in combined_str) and "480p" not in qualities_dict:
-                qualities_dict["480p"] = url
-            elif ("360" in combined_str) and "360p" not in qualities_dict:
-                qualities_dict["360p"] = url
-            elif ("240" in combined_str) and "240p" not in qualities_dict:
-                qualities_dict["240p"] = url
+            if ("/videos/" in url and "/videos-quality/" not in url) or ("720" in combined_str or "hd" in combined_str):
+                if "720p HD" not in qualities_dict:
+                    qualities_dict["720p HD"] = url
+            elif "1080" in combined_str or "fhd" in combined_str:
+                if "1080p FHD" not in qualities_dict:
+                    qualities_dict["1080p FHD"] = url
+            elif "480" in combined_str or "sd" in combined_str:
+                if "480p" not in qualities_dict:
+                    qualities_dict["480p"] = url
+            elif "360" in combined_str:
+                if "360p" not in qualities_dict:
+                    qualities_dict["360p"] = url
             else:
-                if "Direct Link" not in qualities_dict:
-                    qualities_dict["Direct Link"] = url
+                if "Default" not in qualities_dict:
+                    qualities_dict["Default"] = url
 
         return qualities_dict
 
@@ -199,12 +184,16 @@ def extract_all_mp4_qualities(page_url):
         return {}
 
 
-def build_caption(title, qualities_dict, page_url):
-    """Builds an HTML formatted Telegram caption with clickable download links."""
-    lines = [f"⚽️ <b>{title}</b>\n"]
+def build_caption(title, qualities_dict, page_url, quality_label=""):
+    """Builds formatted Telegram HTML caption with direct download links."""
+    lines = [f"⚽️ <b>{title}</b>"]
+    if quality_label:
+        lines.append(f"🎬 <b>Playing Quality:</b> {quality_label}\n")
+    else:
+        lines.append("")
 
     if qualities_dict:
-        lines.append("📥 <b>Download Links:</b>")
+        lines.append("📥 <b>Alternative Download Links:</b>")
         for label, url in qualities_dict.items():
             lines.append(f"▫️ <a href='{url}'>{label}</a>")
         lines.append("")
@@ -215,24 +204,20 @@ def build_caption(title, qualities_dict, page_url):
 
 def upload_video_file_to_telegram(qualities_dict, title, page_url):
     """
-    Attempts to download the highest quality video stream under 50MB
-    and uploads the actual video file to the Telegram channel.
+    Downloads the best available quality under 50MB and uploads it directly to Telegram
+    with native stream playback support enabled.
     """
     api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
-    text_caption = build_caption(title, qualities_dict, page_url)
 
-    # Priority sorting: Highest quality first
     def get_priority(item):
         label = item[0].lower()
         if "1080" in label:
-            return 6
-        if "original" in label or "720" in label:
             return 5
-        if "480" in label:
+        if "720" in label:
             return 4
-        if "360" in label:
+        if "480" in label:
             return 3
-        if "240" in label:
+        if "360" in label:
             return 2
         return 1
 
@@ -251,9 +236,9 @@ def upload_video_file_to_telegram(qualities_dict, title, page_url):
                 content_length = r.headers.get("content-length")
                 if content_length:
                     size_mb = int(content_length) / (1024 * 1024)
-                    print(f"[*] Stream size: {size_mb:.2f} MB")
+                    print(f"[*] Quality [{label}] detected size: {size_mb:.2f} MB")
                     if size_mb > 49.5:
-                        print(f"[-] Stream [{label}] exceeds 50MB. Attempting next quality...")
+                        print(f"[-] Quality [{label}] exceeds 50MB limit. Trying next quality...")
                         continue
 
                 with open(temp_filename, "wb") as f:
@@ -262,27 +247,29 @@ def upload_video_file_to_telegram(qualities_dict, title, page_url):
                             f.write(chunk)
 
             file_size_mb = os.path.getsize(temp_filename) / (1024 * 1024)
-            print(f"[*] Download completed ({file_size_mb:.2f} MB). Uploading to Telegram...")
+            print(f"[*] Download completed ({file_size_mb:.2f} MB). Uploading playable video to Telegram...")
+
+            text_caption = build_caption(title, qualities_dict, page_url, quality_label=label)
 
             with open(temp_filename, "rb") as video_file:
-                files = {"video": video_file}
+                files = {"video": ("video.mp4", video_file, "video/mp4")}
                 data = {
                     "chat_id": CHANNEL_ID,
                     "caption": text_caption,
                     "parse_mode": "HTML",
-                    "supports_streaming": True
+                    "supports_streaming": "true"  # Enables direct in-app streaming in Telegram player
                 }
                 response = requests.post(api_url, data=data, files=files, timeout=300)
                 res_data = response.json()
 
             if res_data.get("ok"):
-                print(f"[✓] Video uploaded successfully in [{label}] quality.")
+                print(f"[✓] Playable video uploaded successfully in [{label}] quality.")
                 return True
             else:
-                print(f"[-] Telegram upload error: {res_data.get('description')}")
+                print(f"[-] Telegram API upload error: {res_data.get('description')}")
 
         except Exception as e:
-            print(f"[-] Error processing quality [{label}]: {e}")
+            print(f"[-] Error uploading quality [{label}]: {e}")
 
         finally:
             if os.path.exists(temp_filename):
@@ -291,8 +278,7 @@ def upload_video_file_to_telegram(qualities_dict, title, page_url):
                 except Exception:
                     pass
 
-    # If all direct uploads fail or are > 50MB, fallback to text message
-    print("[-] Could not upload video file. Falling back to text message...")
+    print("[-] All video file uploads failed. Falling back to text message...")
     return fallback_send_text(title, qualities_dict, page_url)
 
 
@@ -313,7 +299,7 @@ def fallback_send_text(title, qualities_dict, page_url):
 
 
 def process_varzesh3():
-    """Scrapes Varzesh3 highlights and uploads them to Telegram."""
+    """Scrapes Varzesh3 highlights and uploads playable video to Telegram."""
     target_url = "https://video.varzesh3.com"
     sent_videos = load_sent_videos()
     target_teams = load_target_teams()
