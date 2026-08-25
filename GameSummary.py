@@ -30,7 +30,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"Varzesh3 Bot is healthy and running!")
+        self.wfile.write(b"Varzesh3 Bot is running!")
 
     def log_message(self, format, *args):
         return
@@ -48,10 +48,10 @@ def run_health_check_server():
 def validate_config():
     """Validates required environment variables."""
     if not BOT_TOKEN or "YOUR_BOT_TOKEN" in BOT_TOKEN:
-        print("[!] Error: BOT_TOKEN is not configured.")
+        print("[!] Error: BOT_TOKEN is missing.")
         return False
     if not CHANNEL_ID or "-100xxxxxxxxxx" in CHANNEL_ID:
-        print("[!] Error: CHANNEL_ID is not configured.")
+        print("[!] Error: CHANNEL_ID is missing.")
         return False
     return True
 
@@ -62,6 +62,25 @@ def normalize_text(text):
         return ""
     text = text.replace("ي", "ی").replace("ك", "ک").replace("‌", " ")
     return " ".join(text.split()).lower()
+
+
+def clean_title(link_tag):
+    """Extracts a clean, non-duplicated title from a Varzesh3 video card."""
+    raw_title = link_tag.get("title", "").strip()
+    if not raw_title:
+        h_tag = link_tag.find(["h2", "h3", "h4"])
+        if h_tag:
+            raw_title = h_tag.get_text(strip=True)
+        else:
+            raw_title = link_tag.get_text(" ", strip=True)
+
+    # Remove repeated/glued text if scraped twice
+    clean = re.sub(r"\s+", " ", raw_title).strip()
+    mid = len(clean) // 2
+    if len(clean) > 25 and clean[:mid].strip() == clean[mid:].strip():
+        clean = clean[:mid].strip()
+
+    return clean
 
 
 def load_target_teams():
@@ -189,7 +208,7 @@ def build_caption(title, qualities_dict, page_url, quality_label=""):
     """Builds formatted Telegram HTML caption with direct download links."""
     lines = [f"⚽️ <b>{title}</b>"]
     if quality_label:
-        lines.append(f"🎬 <b>Quality:</b> {quality_label}\n")
+        lines.append(f"🎬 <b>Playing Quality:</b> {quality_label}\n")
     else:
         lines.append("")
 
@@ -203,51 +222,57 @@ def build_caption(title, qualities_dict, page_url, quality_label=""):
     return "\n".join(lines)
 
 
-def compress_video_to_fit_limit(input_path, output_path, target_mb=49.0):
-    """
-    Compresses large videos (>50MB) using ffmpeg on GitHub Actions runner
-    to fit Telegram's 50MB limit while keeping HD quality.
-    """
+def get_stream_file_size_mb(url):
+    """Quickly checks file size via HEAD or stream request header."""
     try:
-        print(f"[*] Compressing video with ffmpeg to fit under {target_mb} MB...")
-        
-        # Pass 1: High quality 720p compression
-        cmd1 = [
+        r = requests.head(url, headers=HEADERS, timeout=8, allow_redirects=True)
+        length = r.headers.get("content-length")
+        if length:
+            return int(length) / (1024 * 1024)
+    except Exception:
+        pass
+    return None
+
+
+def fast_compress_video(input_path, output_path, target_mb=48.5):
+    """Fast video compression using ultrafast preset for quick execution."""
+    try:
+        print(f"[*] Fast-compressing video with ffmpeg to fit under {target_mb} MB...")
+        cmd = [
             "ffmpeg", "-y", "-i", input_path,
             "-vf", "scale=-2:min(720\\,ih)",
-            "-c:v", "libx264", "-crf", "27",
-            "-preset", "veryfast",
+            "-c:v", "libx264", "-crf", "28",
+            "-preset", "ultrafast",
+            "-threads", "0",
             "-c:a", "aac", "-b:a", "96k",
             "-movflags", "+faststart",
             output_path
         ]
-        subprocess.run(cmd1, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
         if os.path.exists(output_path):
             compressed_mb = os.path.getsize(output_path) / (1024 * 1024)
-            print(f"[*] Compressed size (Pass 1): {compressed_mb:.2f} MB")
+            print(f"[*] Compressed size: {compressed_mb:.2f} MB")
             if compressed_mb <= target_mb:
                 return True
 
-            # Pass 2: If still slightly > 49MB, compress to 480p
-            print("[*] Running Pass 2 compression (480p)...")
+            # If still > 48.5 MB, quick pass at 480p
+            print("[*] Performing quick secondary pass at 480p...")
             cmd2 = [
                 "ffmpeg", "-y", "-i", input_path,
                 "-vf", "scale=-2:480",
-                "-c:v", "libx264", "-crf", "29",
-                "-preset", "veryfast",
+                "-c:v", "libx264", "-crf", "30",
+                "-preset", "ultrafast",
+                "-threads", "0",
                 "-c:a", "aac", "-b:a", "64k",
                 "-movflags", "+faststart",
                 output_path
             ]
             subprocess.run(cmd2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-            if os.path.exists(output_path):
-                compressed_mb2 = os.path.getsize(output_path) / (1024 * 1024)
-                print(f"[*] Compressed size (Pass 2): {compressed_mb2:.2f} MB")
-                return compressed_mb2 <= target_mb
+            return os.path.exists(output_path) and (os.path.getsize(output_path) / (1024 * 1024) <= target_mb)
 
     except Exception as e:
-        print(f"[-] ffmpeg compression failed: {e}")
+        print(f"[-] Fast compression failed: {e}")
         return False
 
     return False
@@ -255,64 +280,81 @@ def compress_video_to_fit_limit(input_path, output_path, target_mb=49.0):
 
 def upload_video_file_to_telegram(qualities_dict, title, page_url):
     """
-    Downloads the best available quality stream. If > 50MB, compresses it
-    with ffmpeg and uploads the playable video to Telegram.
+    Selects the optimal stream, compresses only if necessary,
+    and uploads playable video directly to Telegram.
     """
     api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
 
-    def get_priority(item):
-        label = item[0].lower()
-        if "1080" in label:
-            return 5
-        if "720" in label:
-            return 4
-        if "480" in label:
-            return 3
-        if "360" in label:
-            return 2
-        return 1
+    # Step 1: Probe sizes of streams to pick the best candidate
+    ready_direct_url = None
+    ready_direct_label = None
 
-    sorted_qualities = sorted(qualities_dict.items(), key=get_priority, reverse=True)
+    compress_candidate_url = None
+    compress_candidate_label = None
+    smallest_size_above_50 = 9999
 
-    # Pick the best quality URL (preferably 720p or 480p)
-    best_label, best_url = sorted_qualities[0]
+    for label, url in qualities_dict.items():
+        size_mb = get_stream_file_size_mb(url)
+        if size_mb:
+            print(f"[*] Stream [{label}] size: {size_mb:.2f} MB")
+            if size_mb <= 49.0:
+                if not ready_direct_url or "720" in label:
+                    ready_direct_url = url
+                    ready_direct_label = label
+            else:
+                if size_mb < smallest_size_above_50:
+                    smallest_size_above_50 = size_mb
+                    compress_candidate_url = url
+                    compress_candidate_label = label
+
+    # If an existing stream is already <= 49MB, use it directly (Ultra Fast!)
+    if ready_direct_url:
+        selected_url = ready_direct_url
+        selected_label = ready_direct_label
+        needs_compression = False
+    elif compress_candidate_url:
+        # Use the smallest stream > 50MB for faster download and compression
+        selected_url = compress_candidate_url
+        selected_label = compress_candidate_label
+        needs_compression = True
+    else:
+        # Fallback to first available quality
+        selected_label, selected_url = list(qualities_dict.items())[0]
+        needs_compression = True
 
     raw_temp_file = f"raw_{int(time.time())}.mp4"
     final_upload_file = f"final_{int(time.time())}.mp4"
 
     try:
-        print(f"[*] Downloading best stream [{best_label}]: {best_url}")
-
-        with requests.get(best_url, headers=HEADERS, stream=True, timeout=90) as r:
+        print(f"[*] Downloading selected stream [{selected_label}]: {selected_url}")
+        with requests.get(selected_url, headers=HEADERS, stream=True, timeout=60) as r:
             r.raise_for_status()
             with open(raw_temp_file, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1024 * 1024):
                     if chunk:
                         f.write(chunk)
 
-        initial_size_mb = os.path.getsize(raw_temp_file) / (1024 * 1024)
-        print(f"[*] Download completed. Initial size: {initial_size_mb:.2f} MB")
+        initial_size = os.path.getsize(raw_temp_file) / (1024 * 1024)
+        print(f"[*] Download completed ({initial_size:.2f} MB).")
 
-        # If already <= 49.5 MB, use directly; otherwise compress with ffmpeg
-        if initial_size_mb <= 49.5:
-            upload_target = raw_temp_file
-            display_label = best_label
+        if initial_size <= 49.0 and not needs_compression:
+            upload_path = raw_temp_file
+            display_label = selected_label
         else:
-            success = compress_video_to_fit_limit(raw_temp_file, final_upload_file)
+            success = fast_compress_video(raw_temp_file, final_upload_file)
             if success:
-                upload_target = final_upload_file
-                display_label = f"{best_label} (Compressed HD)"
+                upload_path = final_upload_file
+                display_label = f"{selected_label} (Compressed HD)"
             else:
                 print("[-] Video exceeds 50MB and compression failed.")
                 return fallback_send_text(title, qualities_dict, page_url)
 
-        # Upload final playable video to Telegram
-        final_size_mb = os.path.getsize(upload_target) / (1024 * 1024)
-        print(f"[*] Uploading playable video ({final_size_mb:.2f} MB) to Telegram...")
+        upload_size = os.path.getsize(upload_path) / (1024 * 1024)
+        print(f"[*] Uploading playable video ({upload_size:.2f} MB) to Telegram...")
 
         text_caption = build_caption(title, qualities_dict, page_url, quality_label=display_label)
 
-        with open(upload_target, "rb") as video_file:
+        with open(upload_path, "rb") as video_file:
             files = {"video": ("highlight.mp4", video_file, "video/mp4")}
             data = {
                 "chat_id": CHANNEL_ID,
@@ -320,7 +362,7 @@ def upload_video_file_to_telegram(qualities_dict, title, page_url):
                 "parse_mode": "HTML",
                 "supports_streaming": "true"
             }
-            response = requests.post(api_url, data=data, files=files, timeout=300)
+            response = requests.post(api_url, data=data, files=files, timeout=180)
             res_data = response.json()
 
         if res_data.get("ok"):
@@ -379,7 +421,7 @@ def process_varzesh3():
 
         for link in links:
             href = link["href"]
-            title = link.get_text(strip=True)
+            title = clean_title(link)
 
             if "/video/" in href and title:
                 is_matched, matched_team = is_matching_team(title, target_teams)
@@ -402,7 +444,7 @@ def process_varzesh3():
                             sent_videos.add(full_page_url)
                             save_sent_videos(sent_videos)
                             found_new += 1
-                            time.sleep(5)
+                            time.sleep(3)
 
         if found_new == 0:
             print("[*] No new highlights matching your team list were found.")
