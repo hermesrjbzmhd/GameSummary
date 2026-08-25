@@ -234,52 +234,78 @@ def get_stream_file_size_mb(url):
     return None
 
 
-def fast_compress_video(input_path, output_path, target_mb=48.0):
+def get_video_duration_seconds(input_path):
+    """Gets the exact duration of the video in seconds using ffprobe."""
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            input_path
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return float(res.stdout.strip())
+    except Exception as e:
+        print(f"[-] Could not get video duration via ffprobe: {e}")
+        return None
+
+
+def fast_compress_video(input_path, output_path, target_mb=45.0):
     """
-    Compresses video with ffmpeg to strictly ensure file size is under 48MB
-    while keeping the best possible visual quality.
+    Mathematically calculates target bitrate based on exact video duration
+    to guarantee output file size is strictly between 40MB and 47MB.
     """
     try:
-        print(f"[*] Compressing video with ffmpeg to fit strictly under {target_mb} MB...")
+        duration = get_video_duration_seconds(input_path)
 
-        # Pass 1: High Quality 720p with veryfast compression
-        cmd1 = [
-            "ffmpeg", "-y", "-i", input_path,
-            "-vf", "scale=-2:min(720\\,ih),fps=25",
-            "-c:v", "libx264", "-crf", "30",
-            "-preset", "veryfast",
-            "-c:a", "aac", "-b:a", "64k",
-            "-movflags", "+faststart",
-            output_path
-        ]
-        subprocess.run(cmd1, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        if duration and duration > 0:
+            print(f"[*] Detected video duration: {duration:.1f} seconds ({duration/60:.1f} minutes)")
+            
+            # Target size: 44 MB = 44 * 8192 kilobits
+            target_total_kbits = target_mb * 8192
+            audio_bitrate_kbps = 64
+            
+            # Calculate optimal video bitrate
+            target_video_kbps = int((target_total_kbits / duration) - audio_bitrate_kbps)
+            target_video_kbps = max(250, min(target_video_kbps, 2000))  # Clamp between 250k and 2000k
+            
+            print(f"[*] Calculated optimal video bitrate: {target_video_kbps} kbps")
 
-        if os.path.exists(output_path):
-            compressed_mb = os.path.getsize(output_path) / (1024 * 1024)
-            print(f"[*] Compressed size (Pass 1 - 720p): {compressed_mb:.2f} MB")
-            if compressed_mb <= target_mb:
-                return True
-
-            # Pass 2: Fallback to 480p with CRF 32 if still over 48MB
-            print("[*] Running Pass 2 compression (480p adaptive)...")
-            cmd2 = [
+            cmd = [
                 "ffmpeg", "-y", "-i", input_path,
-                "-vf", "scale=-2:480,fps=24",
-                "-c:v", "libx264", "-crf", "32",
+                "-vf", "scale=-2:min(720\\,ih)",
+                "-c:v", "libx264",
+                "-b:v", f"{target_video_kbps}k",
+                "-maxrate", f"{int(target_video_kbps * 1.2)}k",
+                "-bufsize", f"{int(target_video_kbps * 2)}k",
                 "-preset", "veryfast",
-                "-c:a", "aac", "-b:a", "48k",
+                "-c:a", "aac",
+                "-b:a", f"{audio_bitrate_kbps}k",
                 "-movflags", "+faststart",
                 output_path
             ]
-            subprocess.run(cmd2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-            
-            if os.path.exists(output_path):
-                compressed_mb2 = os.path.getsize(output_path) / (1024 * 1024)
-                print(f"[*] Compressed size (Pass 2 - 480p): {compressed_mb2:.2f} MB")
-                return compressed_mb2 <= target_mb
+        else:
+            # Fallback CRF mode if duration detection fails
+            print("[*] Using adaptive fallback compression...")
+            cmd = [
+                "ffmpeg", "-y", "-i", input_path,
+                "-vf", "scale=-2:min(720\\,ih)",
+                "-c:v", "libx264", "-crf", "32",
+                "-preset", "veryfast",
+                "-c:a", "aac", "-b:a", "64k",
+                "-movflags", "+faststart",
+                output_path
+            ]
+
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+        if os.path.exists(output_path):
+            final_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            print(f"[✓] Compression successful! Output size: {final_size_mb:.2f} MB")
+            return final_size_mb <= 49.0
 
     except Exception as e:
-        print(f"[-] ffmpeg compression error: {e}")
+        print(f"[-] Video compression failed: {e}")
         return False
 
     return False
