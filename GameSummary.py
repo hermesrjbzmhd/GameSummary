@@ -74,14 +74,14 @@ def clean_title(link_tag):
         else:
             raw_title = link_tag.get_text(" ", strip=True)
 
-    # Remove repeated/glued text if scraped twice
-    clean = re.sub(r"\s+", " ", raw_title).strip()
-    mid = len(clean) // 2
-    if len(clean) > 25 and clean[:mid].strip() == clean[mid:].strip():
-        clean = clean[:mid].strip()
+    # Split on 'خلاصه' if repeated in the text
+    parts = re.split(r'(?=خلاصه)', raw_title)
+    if len(parts) > 1 and parts[0].strip():
+        raw_title = parts[0].strip()
+    elif len(parts) > 1 and not parts[0].strip():
+        raw_title = parts[1].strip()
 
-    return clean
-
+    return re.sub(r'\s+', ' ', raw_title).strip()
 
 def load_target_teams():
     """Loads monitored team names from teams.txt."""
