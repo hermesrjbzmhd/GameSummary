@@ -234,49 +234,55 @@ def get_stream_file_size_mb(url):
     return None
 
 
-def fast_compress_video(input_path, output_path, target_mb=48.5):
-    """Fast video compression using ultrafast preset for quick execution."""
+def fast_compress_video(input_path, output_path, target_mb=48.0):
+    """
+    Compresses video with ffmpeg to strictly ensure file size is under 48MB
+    while keeping the best possible visual quality.
+    """
     try:
-        print(f"[*] Fast-compressing video with ffmpeg to fit under {target_mb} MB...")
-        cmd = [
+        print(f"[*] Compressing video with ffmpeg to fit strictly under {target_mb} MB...")
+
+        # Pass 1: High Quality 720p with veryfast compression
+        cmd1 = [
             "ffmpeg", "-y", "-i", input_path,
-            "-vf", "scale=-2:min(720\\,ih)",
-            "-c:v", "libx264", "-crf", "28",
-            "-preset", "ultrafast",
-            "-threads", "0",
-            "-c:a", "aac", "-b:a", "96k",
+            "-vf", "scale=-2:min(720\\,ih),fps=25",
+            "-c:v", "libx264", "-crf", "30",
+            "-preset", "veryfast",
+            "-c:a", "aac", "-b:a", "64k",
             "-movflags", "+faststart",
             output_path
         ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        subprocess.run(cmd1, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
         if os.path.exists(output_path):
             compressed_mb = os.path.getsize(output_path) / (1024 * 1024)
-            print(f"[*] Compressed size: {compressed_mb:.2f} MB")
+            print(f"[*] Compressed size (Pass 1 - 720p): {compressed_mb:.2f} MB")
             if compressed_mb <= target_mb:
                 return True
 
-            # If still > 48.5 MB, quick pass at 480p
-            print("[*] Performing quick secondary pass at 480p...")
+            # Pass 2: Fallback to 480p with CRF 32 if still over 48MB
+            print("[*] Running Pass 2 compression (480p adaptive)...")
             cmd2 = [
                 "ffmpeg", "-y", "-i", input_path,
-                "-vf", "scale=-2:480",
-                "-c:v", "libx264", "-crf", "30",
-                "-preset", "ultrafast",
-                "-threads", "0",
-                "-c:a", "aac", "-b:a", "64k",
+                "-vf", "scale=-2:480,fps=24",
+                "-c:v", "libx264", "-crf", "32",
+                "-preset", "veryfast",
+                "-c:a", "aac", "-b:a", "48k",
                 "-movflags", "+faststart",
                 output_path
             ]
             subprocess.run(cmd2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-            return os.path.exists(output_path) and (os.path.getsize(output_path) / (1024 * 1024) <= target_mb)
+            
+            if os.path.exists(output_path):
+                compressed_mb2 = os.path.getsize(output_path) / (1024 * 1024)
+                print(f"[*] Compressed size (Pass 2 - 480p): {compressed_mb2:.2f} MB")
+                return compressed_mb2 <= target_mb
 
     except Exception as e:
-        print(f"[-] Fast compression failed: {e}")
+        print(f"[-] ffmpeg compression error: {e}")
         return False
 
     return False
-
 
 def upload_video_file_to_telegram(qualities_dict, title, page_url):
     """
