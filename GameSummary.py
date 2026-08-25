@@ -3,6 +3,7 @@ import re
 import json
 import time
 import threading
+import subprocess
 import requests
 from bs4 import BeautifulSoup
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -29,7 +30,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"Bot is healthy and running!")
+        self.wfile.write(b"Varzesh3 Bot is healthy and running!")
 
     def log_message(self, format, *args):
         return
@@ -174,8 +175,8 @@ def extract_all_mp4_qualities(page_url):
                 if "360p" not in qualities_dict:
                     qualities_dict["360p"] = url
             else:
-                if "Default" not in qualities_dict:
-                    qualities_dict["Default"] = url
+                if "Direct Link" not in qualities_dict:
+                    qualities_dict["Direct Link"] = url
 
         return qualities_dict
 
@@ -188,12 +189,12 @@ def build_caption(title, qualities_dict, page_url, quality_label=""):
     """Builds formatted Telegram HTML caption with direct download links."""
     lines = [f"⚽️ <b>{title}</b>"]
     if quality_label:
-        lines.append(f"🎬 <b>Playing Quality:</b> {quality_label}\n")
+        lines.append(f"🎬 <b>Quality:</b> {quality_label}\n")
     else:
         lines.append("")
 
     if qualities_dict:
-        lines.append("📥 <b>Alternative Download Links:</b>")
+        lines.append("📥 <b>Download Links:</b>")
         for label, url in qualities_dict.items():
             lines.append(f"▫️ <a href='{url}'>{label}</a>")
         lines.append("")
@@ -202,10 +203,60 @@ def build_caption(title, qualities_dict, page_url, quality_label=""):
     return "\n".join(lines)
 
 
+def compress_video_to_fit_limit(input_path, output_path, target_mb=49.0):
+    """
+    Compresses large videos (>50MB) using ffmpeg on GitHub Actions runner
+    to fit Telegram's 50MB limit while keeping HD quality.
+    """
+    try:
+        print(f"[*] Compressing video with ffmpeg to fit under {target_mb} MB...")
+        
+        # Pass 1: High quality 720p compression
+        cmd1 = [
+            "ffmpeg", "-y", "-i", input_path,
+            "-vf", "scale=-2:min(720\\,ih)",
+            "-c:v", "libx264", "-crf", "27",
+            "-preset", "veryfast",
+            "-c:a", "aac", "-b:a", "96k",
+            "-movflags", "+faststart",
+            output_path
+        ]
+        subprocess.run(cmd1, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+        if os.path.exists(output_path):
+            compressed_mb = os.path.getsize(output_path) / (1024 * 1024)
+            print(f"[*] Compressed size (Pass 1): {compressed_mb:.2f} MB")
+            if compressed_mb <= target_mb:
+                return True
+
+            # Pass 2: If still slightly > 49MB, compress to 480p
+            print("[*] Running Pass 2 compression (480p)...")
+            cmd2 = [
+                "ffmpeg", "-y", "-i", input_path,
+                "-vf", "scale=-2:480",
+                "-c:v", "libx264", "-crf", "29",
+                "-preset", "veryfast",
+                "-c:a", "aac", "-b:a", "64k",
+                "-movflags", "+faststart",
+                output_path
+            ]
+            subprocess.run(cmd2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            if os.path.exists(output_path):
+                compressed_mb2 = os.path.getsize(output_path) / (1024 * 1024)
+                print(f"[*] Compressed size (Pass 2): {compressed_mb2:.2f} MB")
+                return compressed_mb2 <= target_mb
+
+    except Exception as e:
+        print(f"[-] ffmpeg compression failed: {e}")
+        return False
+
+    return False
+
+
 def upload_video_file_to_telegram(qualities_dict, title, page_url):
     """
-    Downloads the best available quality under 50MB and uploads it directly to Telegram
-    with native stream playback support enabled.
+    Downloads the best available quality stream. If > 50MB, compresses it
+    with ffmpeg and uploads the playable video to Telegram.
     """
     api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
 
@@ -223,63 +274,73 @@ def upload_video_file_to_telegram(qualities_dict, title, page_url):
 
     sorted_qualities = sorted(qualities_dict.items(), key=get_priority, reverse=True)
 
-    for label, mp4_url in sorted_qualities:
-        temp_filename = f"temp_{int(time.time())}.mp4"
-        try:
-            print(f"[*] Trying video stream [{label}]: {mp4_url}")
+    # Pick the best quality URL (preferably 720p or 480p)
+    best_label, best_url = sorted_qualities[0]
 
-            with requests.get(mp4_url, headers=HEADERS, stream=True, timeout=60) as r:
-                if r.status_code != 200:
-                    print(f"[-] Download stream failed with HTTP {r.status_code}")
-                    continue
+    raw_temp_file = f"raw_{int(time.time())}.mp4"
+    final_upload_file = f"final_{int(time.time())}.mp4"
 
-                content_length = r.headers.get("content-length")
-                if content_length:
-                    size_mb = int(content_length) / (1024 * 1024)
-                    print(f"[*] Quality [{label}] detected size: {size_mb:.2f} MB")
-                    if size_mb > 49.5:
-                        print(f"[-] Quality [{label}] exceeds 50MB limit. Trying next quality...")
-                        continue
+    try:
+        print(f"[*] Downloading best stream [{best_label}]: {best_url}")
 
-                with open(temp_filename, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=1024 * 1024):
-                        if chunk:
-                            f.write(chunk)
+        with requests.get(best_url, headers=HEADERS, stream=True, timeout=90) as r:
+            r.raise_for_status()
+            with open(raw_temp_file, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
 
-            file_size_mb = os.path.getsize(temp_filename) / (1024 * 1024)
-            print(f"[*] Download completed ({file_size_mb:.2f} MB). Uploading playable video to Telegram...")
+        initial_size_mb = os.path.getsize(raw_temp_file) / (1024 * 1024)
+        print(f"[*] Download completed. Initial size: {initial_size_mb:.2f} MB")
 
-            text_caption = build_caption(title, qualities_dict, page_url, quality_label=label)
-
-            with open(temp_filename, "rb") as video_file:
-                files = {"video": ("video.mp4", video_file, "video/mp4")}
-                data = {
-                    "chat_id": CHANNEL_ID,
-                    "caption": text_caption,
-                    "parse_mode": "HTML",
-                    "supports_streaming": "true"  # Enables direct in-app streaming in Telegram player
-                }
-                response = requests.post(api_url, data=data, files=files, timeout=300)
-                res_data = response.json()
-
-            if res_data.get("ok"):
-                print(f"[✓] Playable video uploaded successfully in [{label}] quality.")
-                return True
+        # If already <= 49.5 MB, use directly; otherwise compress with ffmpeg
+        if initial_size_mb <= 49.5:
+            upload_target = raw_temp_file
+            display_label = best_label
+        else:
+            success = compress_video_to_fit_limit(raw_temp_file, final_upload_file)
+            if success:
+                upload_target = final_upload_file
+                display_label = f"{best_label} (Compressed HD)"
             else:
-                print(f"[-] Telegram API upload error: {res_data.get('description')}")
+                print("[-] Video exceeds 50MB and compression failed.")
+                return fallback_send_text(title, qualities_dict, page_url)
 
-        except Exception as e:
-            print(f"[-] Error uploading quality [{label}]: {e}")
+        # Upload final playable video to Telegram
+        final_size_mb = os.path.getsize(upload_target) / (1024 * 1024)
+        print(f"[*] Uploading playable video ({final_size_mb:.2f} MB) to Telegram...")
 
-        finally:
-            if os.path.exists(temp_filename):
+        text_caption = build_caption(title, qualities_dict, page_url, quality_label=display_label)
+
+        with open(upload_target, "rb") as video_file:
+            files = {"video": ("highlight.mp4", video_file, "video/mp4")}
+            data = {
+                "chat_id": CHANNEL_ID,
+                "caption": text_caption,
+                "parse_mode": "HTML",
+                "supports_streaming": "true"
+            }
+            response = requests.post(api_url, data=data, files=files, timeout=300)
+            res_data = response.json()
+
+        if res_data.get("ok"):
+            print(f"[✓] Playable video uploaded successfully to Telegram.")
+            return True
+        else:
+            print(f"[-] Telegram upload error: {res_data.get('description')}")
+            return fallback_send_text(title, qualities_dict, page_url)
+
+    except Exception as e:
+        print(f"[-] Error processing video upload: {e}")
+        return fallback_send_text(title, qualities_dict, page_url)
+
+    finally:
+        for f_path in [raw_temp_file, final_upload_file]:
+            if os.path.exists(f_path):
                 try:
-                    os.remove(temp_filename)
+                    os.remove(f_path)
                 except Exception:
                     pass
-
-    print("[-] All video file uploads failed. Falling back to text message...")
-    return fallback_send_text(title, qualities_dict, page_url)
 
 
 def fallback_send_text(title, qualities_dict, page_url):
