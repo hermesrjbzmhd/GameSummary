@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+temp_*.mp4
+sent_videos.json
+.env
+.DS_Store
