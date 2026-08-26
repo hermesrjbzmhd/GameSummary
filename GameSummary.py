@@ -13,7 +13,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "-100xxxxxxxxxx")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "3600"))
 PORT = int(os.getenv("PORT", 8000))
-MAX_VIDEOS_PER_RUN = 3  # Process maximum 3 videos per run to prevent timeout
+MAX_VIDEOS_PER_RUN = 4  # Process maximum 3 videos per run to prevent timeout
 
 TEAMS_FILE = os.getenv("TEAMS_FILE", "teams.txt")
 HISTORY_FILE = os.getenv("HISTORY_FILE", "sent_videos.json")
