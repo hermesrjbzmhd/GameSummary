@@ -204,24 +204,63 @@ def extract_all_mp4_qualities(page_url):
         print(f"[-] Error extracting qualities from {page_url}: {e}")
         return {}
 
+def format_spoiler_title(title):
+    """
+    Detects match score from title and wraps it in Telegram <tg-spoiler> tags.
+    Extracts team names to format like: 'Team A 🆚 Team B'
+    """
+    clean = re.sub(r"^خلاصه\s+بازی\s*", "", title).strip()
+
+    # Pattern 1: Team1 Score1 - Team2 Score2 (e.g., 'رئال اسپانیول 1 - رئال مادرید 2')
+    m1 = re.match(r"^(.*?)\s+(\d+)\s*[-–—]\s*(.*?)\s+(\d+)$", clean)
+    if m1:
+        t1, s1, t2, s2 = m1.group(1).strip(), m1.group(2), m1.group(3).strip(), m1.group(4)
+        return (
+            f"⚽️ <b>خلاصه بازی {t1} 🆚 {t2}</b>\n"
+            f"📊 نتیجه نهایی: <tg-spoiler><b>{t1} {s1} - {s2} {t2}</b></tg-spoiler>"
+        )
+
+    # Pattern 2: Team1 Score1 - Score2 Team2 (e.g., 'بارسلونا 3 - 0 الچه')
+    m2 = re.match(r"^(.*?)\s+(\d+)\s*[-–—]\s*(\d+)\s+(.*)$", clean)
+    if m2:
+        t1, s1, s2, t2 = m2.group(1).strip(), m2.group(2), m2.group(3), m2.group(4).strip()
+        return (
+            f"⚽️ <b>خلاصه بازی {t1} 🆚 {t2}</b>\n"
+            f"📊 نتیجه نهایی: <tg-spoiler><b>{t1} {s1} - {s2} {t2}</b></tg-spoiler>"
+        )
+
+    # Fallback: Wrap any standalone score (e.g., '1 - 0') in spoiler
+    if re.search(r"\d+\s*[-–—]\s*\d+", title):
+        spoiler_title = re.sub(r"(\d+\s*[-–—]\s*\d+)", r"<tg-spoiler><b>\1</b></tg-spoiler>", title)
+        return f"⚽️ <b>{spoiler_title}</b>"
+
+    return f"⚽️ <b>{title}</b>"
+
 
 def build_caption(title, qualities_dict, page_url, quality_label=""):
-    """Builds formatted Telegram HTML caption with direct download links."""
-    lines = [f"⚽️ <b>{title}</b>"]
+    """Builds a clean, professional Persian Telegram caption with spoiler result."""
+    header_text = format_spoiler_title(title)
+    lines = [header_text]
+
     if quality_label:
-        lines.append(f"🎬 <b>Quality:</b> {quality_label}\n")
-    else:
-        lines.append("")
+        display_q = quality_label.replace("Compressed HD", "HD بهینه‌شده")
+        lines.append(f"🎬 کیفیت پخش: <b>{display_q}</b>")
+
+    lines.append("")  # Empty line for spacing
 
     if qualities_dict:
-        lines.append("📥 <b>Download Links:</b>")
+        lines.append("📥 <b>لینک‌های دانلود مستقیم:</b>")
         for label, url in qualities_dict.items():
-            lines.append(f"▫️ <a href='{url}'>{label}</a>")
+            clean_label = (
+                label.replace("Direct Link", "کیفیت استاندارد")
+                     .replace("Original", "اصلی")
+                     .replace("FHD", "Full HD")
+            )
+            lines.append(f"▫️ <a href='{url}'>{clean_label}</a>")
         lines.append("")
 
-    lines.append(f"🔗 <a href='{page_url}'>Watch on Varzesh3</a>")
+    lines.append(f"🔗 <a href='{page_url}'>مشاهده در سایت ورزش سه</a>")
     return "\n".join(lines)
-
 
 def get_stream_file_size_mb(url):
     """Quickly checks file size via HEAD request."""
