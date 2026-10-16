@@ -31,10 +31,17 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "3600"))
 PORT = int(os.getenv("PORT", 8000))
 MAX_VIDEOS_PER_RUN = 5  # Process maximum 5 videos per run to prevent timeout
 
-TEAMS_FILE = os.getenv("TEAMS_FILE", "teams.txt")
-HISTORY_FILE = os.getenv("HISTORY_FILE", "sent_videos.json")
-CHANNELS_FILE = os.getenv("CHANNELS_FILE", "channels.json")
-CONFIG_FILE = os.getenv("CONFIG_FILE", "config.json")
+DATA_DIR = os.getenv("DATA_DIR")
+if not DATA_DIR:
+    if os.path.exists("/data") and os.path.isdir("/data"):
+        DATA_DIR = "/data"
+    else:
+        DATA_DIR = "."
+
+TEAMS_FILE = os.path.join(DATA_DIR, os.getenv("TEAMS_FILE", "teams.txt"))
+HISTORY_FILE = os.path.join(DATA_DIR, os.getenv("HISTORY_FILE", "sent_videos.json"))
+CHANNELS_FILE = os.path.join(DATA_DIR, os.getenv("CHANNELS_FILE", "channels.json"))
+CONFIG_FILE = os.path.join(DATA_DIR, os.getenv("CONFIG_FILE", "config.json"))
 WORKFLOW_FILE = os.getenv("WORKFLOW_FILE", ".github/workflows/bot.yaml")
 ADMIN_ID = (
     os.getenv("ADMIN_ID")
@@ -42,6 +49,8 @@ ADMIN_ID = (
     or os.getenv("TELEGRAM_ADMIN_ID")
     or ""
 )
+
+ADMIN_STATE = {}  # {chat_id: {"action": "...", "data": ...}}
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -210,19 +219,24 @@ def clean_title(link_tag):
 
 
 def load_target_teams():
-    """Loads monitored team names from teams.txt and optional TEAMS environment variable."""
+    """Loads monitored team names from teams.txt and optional TARGET_TEAMS / TEAMS environment variable."""
     teams = []
     if os.path.exists(TEAMS_FILE):
         with open(TEAMS_FILE, "r", encoding="utf-8") as f:
             for line in f:
                 cleaned = line.strip()
                 if cleaned and not cleaned.startswith("#"):
-                    teams.append(normalize_text(cleaned))
+                    teams.append(cleaned)
+    elif os.path.exists("teams.txt"):
+        with open("teams.txt", "r", encoding="utf-8") as f:
+            for line in f:
+                cleaned = line.strip()
+                if cleaned and not cleaned.startswith("#"):
+                    teams.append(cleaned)
     else:
-        default_teams = ["پرسپولیس", "استقلال", "رئال مادرید", "بارسلونا"]
-        with open(TEAMS_FILE, "w", encoding="utf-8") as f:
-            f.write("\n".join(default_teams))
-        teams = [normalize_text(t) for t in default_teams]
+        default_teams = ["پرسپولیس", "استقلال", "سپاهان", "تراکتور", "رئال مادرید", "بارسلونا", "منچستر سیتی", "آرسنال"]
+        teams = default_teams
+        save_target_teams(teams)
 
     # Support adding or overriding teams via environment variable TARGET_TEAMS / TEAMS
     env_teams = os.getenv("TARGET_TEAMS") or os.getenv("TEAMS")
@@ -230,10 +244,29 @@ def load_target_teams():
         for t in env_teams.replace("\n", ",").split(","):
             cleaned = t.strip()
             if cleaned and not cleaned.startswith("#"):
-                teams.append(normalize_text(cleaned))
+                teams.append(cleaned)
 
     # Deduplicate while preserving order
-    return list(dict.fromkeys(teams))
+    seen = set()
+    result = []
+    for t in teams:
+        norm = normalize_text(t)
+        if norm and norm not in seen:
+            seen.add(norm)
+            result.append(t)
+    return result
+
+
+def save_target_teams(teams):
+    """Saves monitored teams list to TEAMS_FILE."""
+    with open(TEAMS_FILE, "w", encoding="utf-8") as f:
+        f.write("# ==========================================\n")
+        f.write("# لیست تیم‌های تحت نظارت ربات (Teams List)\n")
+        f.write("# ==========================================\n\n")
+        for t in teams:
+            t_clean = t.strip()
+            if t_clean:
+                f.write(f"{t_clean}\n")
 
 
 def load_sent_videos():
@@ -803,6 +836,22 @@ MAIN_REPLY_KEYBOARD = {
 }
 
 
+def init_persistent_storage():
+    """Copies default repository files to DATA_DIR if using persistent storage."""
+    if DATA_DIR != ".":
+        os.makedirs(DATA_DIR, exist_ok=True)
+        for fname in ["teams.txt", "channels.json", "sent_videos.json", "config.json"]:
+            src = os.path.join(".", fname)
+            dst = os.path.join(DATA_DIR, fname)
+            if os.path.exists(src) and not os.path.exists(dst):
+                try:
+                    import shutil
+                    shutil.copy(src, dst)
+                    print(f"[*] Copied default {fname} to persistent volume: {DATA_DIR}")
+                except Exception as e:
+                    print(f"[-] Error copying {fname} to {DATA_DIR}: {e}")
+
+
 def get_interval_display(seconds):
     mapping = {
         900: "۱۵ دقیقه",
@@ -818,21 +867,20 @@ def get_interval_display(seconds):
 
 
 def build_main_dashboard_keyboard():
-    """Clean, categorized main panel with only 3 rows."""
+    """Clean, categorized main panel."""
     return {
         "inline_keyboard": [
             [{"text": "⏱ تنظیم زمان‌بندی بررسی", "callback_data": "menu:interval"}],
             [{"text": "🚀 بررسی فوری مسابقات ورزش ۳", "callback_data": "menu:check"}],
             [
-                {"text": "📋 مشاهده تیم‌ها", "callback_data": "menu:teams"},
-                {"text": "📢 مشاهده کانال‌ها", "callback_data": "menu:channels"}
+                {"text": "📋 مدیریت تیم‌ها", "callback_data": "menu:teams"},
+                {"text": "📢 مدیریت کانال‌ها", "callback_data": "menu:channels"}
             ]
         ]
     }
 
 
 def build_interval_submenu_keyboard(current_seconds=None):
-    """Submenu specifically for changing check interval."""
     if current_seconds is None:
         current_seconds = CHECK_INTERVAL
 
@@ -854,13 +902,86 @@ def build_interval_submenu_keyboard(current_seconds=None):
     return {"inline_keyboard": keyboard}
 
 
-def build_back_keyboard():
-    """Simple back button for detail views."""
+def build_back_keyboard(back_callback="menu:home"):
     return {
         "inline_keyboard": [
+            [{"text": "🔙 بازگشت", "callback_data": back_callback}]
+        ]
+    }
+
+
+def build_teams_keyboard():
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "➕ افزودن تیم جدید", "callback_data": "teams:add"},
+                {"text": "🗑 حذف تیم", "callback_data": "teams:del_menu"}
+            ],
             [{"text": "🔙 بازگشت به پنل اصلی", "callback_data": "menu:home"}]
         ]
     }
+
+
+def build_teams_delete_keyboard():
+    teams = load_target_teams()
+    keyboard = []
+    row = []
+    for i, t in enumerate(teams):
+        row.append({"text": f"❌ {t}", "callback_data": f"team_del:{i}"})
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([{"text": "🔙 بازگشت به مدیریت تیم‌ها", "callback_data": "menu:teams"}])
+    return {"inline_keyboard": keyboard}
+
+
+def build_channels_keyboard():
+    return {
+        "inline_keyboard": [
+            [{"text": "➕ افزودن کانال جدید", "callback_data": "chan:add"}],
+            [
+                {"text": "✏️ تغییر فرمت کپشن", "callback_data": "chan:fmt_menu"},
+                {"text": "🗑 حذف کانال", "callback_data": "chan:del_menu"}
+            ],
+            [{"text": "🔙 بازگشت به پنل اصلی", "callback_data": "menu:home"}]
+        ]
+    }
+
+
+def build_channels_select_for_format_keyboard():
+    channels = load_channels()
+    keyboard = []
+    for ch in channels:
+        cid = str(ch.get("id"))
+        cname = ch.get("name") or cid
+        cfmt = ch.get("format", "full")
+        keyboard.append([{"text": f"📢 {cname} ({cfmt})", "callback_data": f"chan_choose_fmt:{cid}"}])
+    keyboard.append([{"text": "🔙 بازگشت به مدیریت کانال‌ها", "callback_data": "menu:channels"}])
+    return {"inline_keyboard": keyboard}
+
+
+def build_channels_format_pick_keyboard(cid):
+    return {
+        "inline_keyboard": [
+            [{"text": "⚡️ خیلی کوتاه (فقط نام دو تیم)", "callback_data": f"chan_setfmt:{cid}:short"}],
+            [{"text": "📄 کامل با کیفیت‌ها و لینک دانلود", "callback_data": f"chan_setfmt:{cid}:full"}],
+            [{"text": "🔕 کامل بدون لینک دانلود", "callback_data": f"chan_setfmt:{cid}:no_links"}],
+            [{"text": "🔙 بازگشت به لیست کانال‌ها", "callback_data": "menu:channels"}]
+        ]
+    }
+
+
+def build_channels_delete_keyboard():
+    channels = load_channels()
+    keyboard = []
+    for ch in channels:
+        cid = str(ch.get("id"))
+        cname = ch.get("name") or cid
+        keyboard.append([{"text": f"❌ {cname} ({cid})", "callback_data": f"chan_del:{cid}"}])
+    keyboard.append([{"text": "🔙 بازگشت به مدیریت کانال‌ها", "callback_data": "menu:channels"}])
+    return {"inline_keyboard": keyboard}
 
 
 def get_dashboard_text():
@@ -890,14 +1011,16 @@ def get_interval_submenu_text():
 def get_teams_text():
     teams = load_target_teams()
     if not teams:
-        return "📋 هیچ تیمی در لیست مانیتورینگ نیست."
+        return (
+            "📋 <b>مدیریت تیم‌های تحت نظارت</b>\n\n"
+            "⚠️ هیچ تیمی در لیست مانیتورینگ نیست.\n\n"
+            "برای افزودن، دکمه <b>➕ افزودن تیم جدید</b> را بزنید."
+        )
     teams_list = "\n".join([f"{i+1}. {t}" for i, t in enumerate(teams)])
     return (
-        f"📋 <b>لیست تیم‌های تحت نظارت ({len(teams)} تیم):</b>\n\n"
+        f"📋 <b>مدیریت تیم‌های تحت نظارت ({len(teams)} تیم):</b>\n\n"
         f"{teams_list}\n\n"
-        "💡 <b>ثبت دائمی تیم‌ها:</b>\n"
-        "▫️ فایل <code>teams.txt</code> را در گیت‌هاب ویرایش کنید.\n"
-        "▫️ یا متغیر <code>TARGET_TEAMS</code> را در ریل‌وی تنظیم نمایید."
+        "👇 <i>از دکمه‌های زیر برای افزودن یا حذف کلیکی تیم‌ها استفاده کنید:</i>"
     )
 
 
@@ -905,20 +1028,20 @@ def get_channels_text():
     channels = load_channels()
     if not channels:
         return (
-            "📢 <b>هیچ کانالی متصل نیست!</b>\n\n"
-            "💡 برای ثبت دائمی کانال، متغیر <code>TELEGRAM_CHANNEL_ID</code> را در ریل‌وی ست کنید."
+            "📢 <b>مدیریت کانال‌های فعال</b>\n\n"
+            "⚠️ هیچ کانالی متصل نیست!\n\n"
+            "برای اتصال، دکمه <b>➕ افزودن کانال جدید</b> را بزنید."
         )
     ch_lines = []
     for i, ch in enumerate(channels):
         fmt = ch.get("format", "full")
-        fmt_fa = "خیلی کوتاه فقط نام تیم‌ها (short)" if fmt == "short" else ("کامل با لینک (full)" if fmt == "full" else fmt)
+        fmt_fa = "خیلی کوتاه فقط نام تیم‌ها (short)" if fmt == "short" else ("کامل با لینک (full)" if fmt == "full" else ("بدون لینک (no_links)" if fmt == "no_links" else fmt))
         sig = ch.get("signature") or "ندارد"
         ch_lines.append(f"{i+1}. <b>{ch.get('name', 'کانال')}</b> (<code>{ch.get('id')}</code>)\n   ▫️ فرمت: <code>{fmt_fa}</code> | امضا: <code>{sig}</code>")
     return (
-        f"📢 <b>کانال‌های فعال ({len(channels)} کانال):</b>\n\n"
+        f"📢 <b>مدیریت کانال‌های فعال ({len(channels)} کانال):</b>\n\n"
         + "\n\n".join(ch_lines)
-        + "\n\n💡 <b>ثبت دائمی کانال‌ها:</b>\n"
-        + "برای اینکه کانال‌ها با آپدیت حذف نشوند، آن‌ها را در متغیرهای <code>TELEGRAM_CHANNEL_ID</code> و <code>CHANNEL_2_ID</code> در ریل‌وی وارد کنید."
+        + "\n\n👇 <i>از دکمه‌های زیر برای افزودن، حذف یا تغییر فرمت کانال‌ها استفاده کنید:</i>"
     )
 
 
@@ -1037,7 +1160,7 @@ def update_workflow_interval(interval_str):
 
 
 def process_telegram_admin_commands():
-    """Fetches and executes pending admin commands and button clicks from Telegram."""
+    """Fetches and executes pending admin commands, text inputs, and button clicks from Telegram."""
     if not BOT_TOKEN or "YOUR_BOT_TOKEN" in BOT_TOKEN:
         return
 
@@ -1063,7 +1186,7 @@ def process_telegram_admin_commands():
             if update_id > last_update_id:
                 last_update_id = update_id
 
-            # 1. Handle Inline Button Click (callback_query)
+            # 1. Handle Inline Button Clicks (callback_query)
             if "callback_query" in update:
                 cb = update["callback_query"]
                 cb_id = cb["id"]
@@ -1077,7 +1200,26 @@ def process_telegram_admin_commands():
                     answer_callback_query(cb_id, text="⛔️ دسترسی غیرمجاز!", show_alert=True)
                     continue
 
-                if cb_data == "menu:interval":
+                # Main Home
+                if cb_data == "menu:home":
+                    answer_callback_query(cb_id)
+                    ADMIN_STATE.pop(cb_chat_id, None)
+                    if cb_msg_id:
+                        edit_telegram_admin_message(
+                            cb_chat_id, cb_msg_id,
+                            get_dashboard_text(),
+                            reply_markup=build_main_dashboard_keyboard()
+                        )
+
+                # Check Now
+                elif cb_data == "menu:check":
+                    answer_callback_query(cb_id, text="🚀 بررسی مسابقات ورزش ۳ آغاز شد...")
+                    send_telegram_admin_message(cb_chat_id, "🔄 در حال بررسی لحظه‌ای سایت ورزش ۳...")
+                    process_varzesh3()
+                    send_telegram_admin_message(cb_chat_id, "✅ بررسی ورزش ۳ به پایان رسید.", reply_markup=MAIN_REPLY_KEYBOARD)
+
+                # Interval Submenu
+                elif cb_data == "menu:interval":
                     answer_callback_query(cb_id)
                     if cb_msg_id:
                         edit_telegram_admin_message(
@@ -1097,49 +1239,168 @@ def process_telegram_admin_commands():
                             reply_markup=build_interval_submenu_keyboard(CHECK_INTERVAL)
                         )
 
-                elif cb_data == "menu:check":
-                    answer_callback_query(cb_id, text="🚀 بررسی مسابقات ورزش ۳ آغاز شد...")
-                    send_telegram_admin_message(cb_chat_id, "🔄 در حال بررسی لحظه‌ای سایت ورزش ۳...")
-                    process_varzesh3()
-                    send_telegram_admin_message(cb_chat_id, "✅ بررسی ورزش ۳ به پایان رسید.", reply_markup=MAIN_REPLY_KEYBOARD)
-
+                # --- TEAMS CRUD ---
                 elif cb_data == "menu:teams":
                     answer_callback_query(cb_id)
+                    ADMIN_STATE.pop(cb_chat_id, None)
                     if cb_msg_id:
                         edit_telegram_admin_message(
                             cb_chat_id, cb_msg_id,
                             get_teams_text(),
-                            reply_markup=build_back_keyboard()
+                            reply_markup=build_teams_keyboard()
                         )
 
+                elif cb_data == "teams:add":
+                    answer_callback_query(cb_id)
+                    ADMIN_STATE[cb_chat_id] = {"action": "wait_team_name"}
+                    if cb_msg_id:
+                        edit_telegram_admin_message(
+                            cb_chat_id, cb_msg_id,
+                            "➕ <b>افزودن تیم جدید:</b>\n\nلطفاً نام تیم مورد نظر را در چت تایپ و ارسال کنید:\n(مثال: <code>میلان</code> یا <code>دورتموند</code>)",
+                            reply_markup=build_back_keyboard("menu:teams")
+                        )
+
+                elif cb_data == "teams:del_menu":
+                    answer_callback_query(cb_id)
+                    if cb_msg_id:
+                        edit_telegram_admin_message(
+                            cb_chat_id, cb_msg_id,
+                            "🗑 <b>حذف تیم:</b>\n\nروی نام تیمی که قصد حذف آن را دارید کلیک کنید:",
+                            reply_markup=build_teams_delete_keyboard()
+                        )
+
+                elif cb_data.startswith("team_del:"):
+                    try:
+                        idx = int(cb_data.split(":")[1])
+                        teams = load_target_teams()
+                        if 0 <= idx < len(teams):
+                            del_name = teams.pop(idx)
+                            save_target_teams(teams)
+                            answer_callback_query(cb_id, text=f"❌ تیم {del_name} حذف شد.")
+                            if cb_msg_id:
+                                edit_telegram_admin_message(
+                                    cb_chat_id, cb_msg_id,
+                                    "🗑 <b>حذف تیم:</b>\n\nروی نام تیمی که قصد حذف آن را دارید کلیک کنید:",
+                                    reply_markup=build_teams_delete_keyboard()
+                                )
+                    except Exception as e:
+                        print(f"[-] Error deleting team: {e}")
+
+                # --- CHANNELS CRUD ---
                 elif cb_data == "menu:channels":
                     answer_callback_query(cb_id)
+                    ADMIN_STATE.pop(cb_chat_id, None)
                     if cb_msg_id:
                         edit_telegram_admin_message(
                             cb_chat_id, cb_msg_id,
                             get_channels_text(),
-                            reply_markup=build_back_keyboard()
+                            reply_markup=build_channels_keyboard()
                         )
 
-                elif cb_data == "menu:home":
+                elif cb_data == "chan:add":
+                    answer_callback_query(cb_id)
+                    ADMIN_STATE[cb_chat_id] = {"action": "wait_channel_input"}
+                    if cb_msg_id:
+                        edit_telegram_admin_message(
+                            cb_chat_id, cb_msg_id,
+                            "➕ <b>افزودن کانال جدید:</b>\n\n"
+                            "لطفاً یک پیام از کانال را به اینجا <b>فوروارد</b> کنید، یا آیدی عددی کانال (مثلاً <code>-1001234567890</code>) را ارسال کنید:\n\n"
+                            "⚠️ <i>دقت فرمایید ربات باید در کانال مقصد ادمین با دسترسی ارسال پیام باشد.</i>",
+                            reply_markup=build_back_keyboard("menu:channels")
+                        )
+
+                elif cb_data.startswith("chan_new_fmt:"):
+                    fmt = cb_data.split(":")[1]
+                    st = ADMIN_STATE.get(cb_chat_id, {})
+                    cid = st.get("id")
+                    title = st.get("title", f"کانال {cid}")
+                    if cid:
+                        channels = load_channels()
+                        channels = [c for c in channels if str(c.get("id")) != str(cid)]
+                        channels.append({
+                            "id": str(cid),
+                            "name": title,
+                            "format": fmt,
+                            "signature": ""
+                        })
+                        save_channels(channels)
+                        ADMIN_STATE.pop(cb_chat_id, None)
+                        answer_callback_query(cb_id, text=f"✅ کانال {title} اضافه شد.")
+                        if cb_msg_id:
+                            edit_telegram_admin_message(
+                                cb_chat_id, cb_msg_id,
+                                f"✅ کانال <b>{title}</b> (<code>{cid}</code>) با فرمت <b>{fmt}</b> با موفقیت اضافه شد.",
+                                reply_markup=build_back_keyboard("menu:channels")
+                            )
+
+                elif cb_data == "chan:fmt_menu":
                     answer_callback_query(cb_id)
                     if cb_msg_id:
                         edit_telegram_admin_message(
                             cb_chat_id, cb_msg_id,
-                            get_dashboard_text(),
-                            reply_markup=build_main_dashboard_keyboard()
+                            "✏️ <b>تغییر فرمت کپشن کانال:</b>\n\nکانال مورد نظر را انتخاب کنید:",
+                            reply_markup=build_channels_select_for_format_keyboard()
+                        )
+
+                elif cb_data.startswith("chan_choose_fmt:"):
+                    cid = cb_data.split(":")[1]
+                    answer_callback_query(cb_id)
+                    if cb_msg_id:
+                        edit_telegram_admin_message(
+                            cb_chat_id, cb_msg_id,
+                            f"✏️ <b>انتخاب فرمت برای کانال <code>{cid}</code>:</b>\n\nفرمت مورد نظر خود را انتخاب کنید:",
+                            reply_markup=build_channels_format_pick_keyboard(cid)
+                        )
+
+                elif cb_data.startswith("chan_setfmt:"):
+                    parts = cb_data.split(":")
+                    cid = parts[1]
+                    fmt = parts[2]
+                    channels = load_channels()
+                    for ch in channels:
+                        if str(ch.get("id")) == str(cid):
+                            ch["format"] = fmt
+                    save_channels(channels)
+                    answer_callback_query(cb_id, text=f"✅ فرمت به {fmt} تغییر یافت.")
+                    if cb_msg_id:
+                        edit_telegram_admin_message(
+                            cb_chat_id, cb_msg_id,
+                            get_channels_text(),
+                            reply_markup=build_channels_keyboard()
+                        )
+
+                elif cb_data == "chan:del_menu":
+                    answer_callback_query(cb_id)
+                    if cb_msg_id:
+                        edit_telegram_admin_message(
+                            cb_chat_id, cb_msg_id,
+                            "🗑 <b>حذف کانال:</b>\n\nروی کانالی که قصد حذف آن را دارید کلیک کنید:",
+                            reply_markup=build_channels_delete_keyboard()
+                        )
+
+                elif cb_data.startswith("chan_del:"):
+                    cid = cb_data.split(":")[1]
+                    channels = load_channels()
+                    channels = [c for c in channels if str(c.get("id")) != str(cid)]
+                    save_channels(channels)
+                    answer_callback_query(cb_id, text="کانال با موفقیت حذف شد.")
+                    if cb_msg_id:
+                        edit_telegram_admin_message(
+                            cb_chat_id, cb_msg_id,
+                            "🗑 <b>حذف کانال:</b>\n\nروی کانالی که قصد حذف آن را دارید کلیک کنید:",
+                            reply_markup=build_channels_delete_keyboard()
                         )
 
                 continue
 
-            # 2. Handle Text Messages / Reply Keyboard buttons
+            # 2. Handle Text Messages and Forwards
             message = update.get("message")
-            if not message or "text" not in message:
+            if not message:
                 continue
 
             chat_id = message["chat"]["id"]
             from_id = str(message.get("from", {}).get("id", ""))
-            text = message["text"].strip()
+            text = (message.get("text") or "").strip()
 
             # Handle /setadmin command
             if text.lower() == "/setadmin":
@@ -1172,10 +1433,81 @@ def process_telegram_admin_commands():
                 )
                 continue
 
-            # Route by reply keyboard buttons or commands
+            # Check if admin is in interactive input state
+            user_state = ADMIN_STATE.get(chat_id, {})
+            current_action = user_state.get("action")
+
+            if current_action == "wait_team_name" and text:
+                team_name = text.strip()
+                teams = load_target_teams()
+                norm_existing = [normalize_text(t) for t in teams]
+                if normalize_text(team_name) in norm_existing:
+                    send_telegram_admin_message(
+                        chat_id,
+                        f"⚠️ تیم <b>{team_name}</b> از قبل در لیست وجود دارد.",
+                        reply_markup=build_teams_keyboard()
+                    )
+                else:
+                    teams.append(team_name)
+                    save_target_teams(teams)
+                    send_telegram_admin_message(
+                        chat_id,
+                        f"✅ تیم <b>{team_name}</b> با موفقیت به لیست مانیتورینگ اضافه شد!",
+                        reply_markup=build_teams_keyboard()
+                    )
+                ADMIN_STATE.pop(chat_id, None)
+                continue
+
+            elif current_action == "wait_channel_input":
+                chan_id = None
+                chan_title = "کانال"
+
+                # Check if message is forwarded from a channel
+                fwd_chat = message.get("forward_from_chat")
+                if fwd_chat and fwd_chat.get("type") == "channel":
+                    chan_id = str(fwd_chat.get("id"))
+                    chan_title = fwd_chat.get("title") or f"کانال {chan_id}"
+                elif text:
+                    # Clean input text
+                    clean_id = text.replace(" ", "").strip()
+                    if clean_id.startswith("-100") or clean_id.startswith("-") or clean_id.isdigit():
+                        chan_id = clean_id
+                        chan_title = f"کانال {chan_id}"
+
+                if not chan_id:
+                    send_telegram_admin_message(
+                        chat_id,
+                        "⚠️ آیدی یا پیام فوروارد شده نامعتبر است.\nلطفاً یک پیام از کانال فوروارد کنید یا آیدی عددی (مثل <code>-1001234567890</code>) بفرستید.",
+                        reply_markup=build_back_keyboard("menu:channels")
+                    )
+                    continue
+
+                ADMIN_STATE[chat_id] = {
+                    "action": "wait_channel_format",
+                    "id": chan_id,
+                    "title": chan_title
+                }
+
+                format_pick_kb = {
+                    "inline_keyboard": [
+                        [{"text": "⚡️ خیلی کوتاه (فقط نام دو تیم)", "callback_data": "chan_new_fmt:short"}],
+                        [{"text": "📄 کامل با کیفیت‌ها و لینک دانلود", "callback_data": "chan_new_fmt:full"}],
+                        [{"text": "🔕 کامل بدون لینک دانلود", "callback_data": "chan_new_fmt:no_links"}],
+                        [{"text": "❌ انصراف", "callback_data": "menu:channels"}]
+                    ]
+                }
+                send_telegram_admin_message(
+                    chat_id,
+                    f"✅ کانال <b>{chan_title}</b> (<code>{chan_id}</code>) دریافت شد.\n\n👇 نوع فرمت ارسال برای این کانال را انتخاب کنید:",
+                    reply_markup=format_pick_kb
+                )
+                continue
+
+            # Standard Navigation
             cmd = text.split()[0].lower() if text else ""
 
             if cmd in ["/start", "/panel", "/admin", "/help"] or text in ["🎛 پنل مدیریت", "🎛 پنل کنترل"]:
+                ADMIN_STATE.pop(chat_id, None)
                 send_telegram_admin_message(
                     chat_id,
                     get_dashboard_text(),
@@ -1214,6 +1546,7 @@ def admin_polling_worker():
 
 # ==================== MAIN ENTRY POINT ====================
 if __name__ == "__main__":
+    init_persistent_storage()
     if not validate_config():
         exit(1)
 
