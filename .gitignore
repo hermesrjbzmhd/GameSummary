@@ -1,5 +1,8 @@
 __pycache__/
 *.pyc
 temp_*.mp4
+raw_*.mp4
+final_*.mp4
+*.mp4
 .env
 .DS_Store

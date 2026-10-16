@@ -4,6 +4,7 @@ import json
 import time
 import threading
 import subprocess
+import unicodedata
 import requests
 from bs4 import BeautifulSoup
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -58,10 +59,12 @@ def validate_config():
 
 
 def normalize_text(text):
-    """Normalizes Persian/Arabic characters and spaces for matching."""
+    """Normalizes Persian/Arabic characters, decomposed forms, and spaces for matching."""
     if not text:
         return ""
+    text = unicodedata.normalize("NFC", text)
     text = text.replace("ي", "ی").replace("ك", "ک").replace("‌", " ")
+    text = text.replace("آ", "آ").replace("ئ", "ئ").replace("یٔ", "ئ")
     return " ".join(text.split()).lower()
 
 
@@ -85,20 +88,30 @@ def clean_title(link_tag):
 
 
 def load_target_teams():
-    """Loads monitored team names from teams.txt."""
-    if not os.path.exists(TEAMS_FILE):
+    """Loads monitored team names from teams.txt and optional TEAMS environment variable."""
+    teams = []
+    if os.path.exists(TEAMS_FILE):
+        with open(TEAMS_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                cleaned = line.strip()
+                if cleaned and not cleaned.startswith("#"):
+                    teams.append(normalize_text(cleaned))
+    else:
         default_teams = ["پرسپولیس", "استقلال", "رئال مادرید", "بارسلونا"]
         with open(TEAMS_FILE, "w", encoding="utf-8") as f:
             f.write("\n".join(default_teams))
-        return [normalize_text(t) for t in default_teams]
+        teams = [normalize_text(t) for t in default_teams]
 
-    teams = []
-    with open(TEAMS_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            cleaned = line.strip()
+    # Support adding or overriding teams via environment variable TEAMS (comma or newline separated)
+    env_teams = os.getenv("TEAMS")
+    if env_teams:
+        for t in env_teams.replace("\n", ",").split(","):
+            cleaned = t.strip()
             if cleaned and not cleaned.startswith("#"):
                 teams.append(normalize_text(cleaned))
-    return teams
+
+    # Deduplicate while preserving order
+    return list(dict.fromkeys(teams))
 
 
 def load_sent_videos():
@@ -304,7 +317,7 @@ def fast_compress_video(input_path, output_path, target_mb=45.0):
 
             cmd = [
                 "ffmpeg", "-y", "-i", input_path,
-                "-vf", "scale=-2:min(720\\,ih)",
+                "-vf", r"scale=-2:min(720\,ih)",
                 "-c:v", "libx264",
                 "-b:v", f"{target_video_kbps}k",
                 "-maxrate", f"{int(target_video_kbps * 1.2)}k",
@@ -348,71 +361,93 @@ def fast_compress_video(input_path, output_path, target_mb=45.0):
 
 
 def upload_video_file_to_telegram(qualities_dict, title, page_url):
-    """Selects best stream, compresses if needed, and uploads to Telegram."""
+    """Selects highest quality stream (HD priority), compresses if >50MB, and uploads to Telegram."""
     api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
 
-    ready_direct_url = None
-    ready_direct_label = None
-    compress_candidate_url = None
-    compress_candidate_label = None
-    smallest_size_above_50 = 9999
+    # Prioritize resolutions: 720p HD first, then 1080p FHD, then 480p, then 360p/Direct Link
+    priority_order = ["720p", "1080p", "480p", "360p", "direct"]
+    sorted_candidates = []
 
+    for key in priority_order:
+        for label, url in qualities_dict.items():
+            if key in label.lower() and (label, url) not in sorted_candidates:
+                sorted_candidates.append((label, url))
+
+    # Add remaining qualities if not already included
     for label, url in qualities_dict.items():
-        size_mb = get_stream_file_size_mb(url)
-        if size_mb:
-            print(f"[*] Stream [{label}] probe size: {size_mb:.2f} MB")
-            if size_mb <= 49.0:
-                if not ready_direct_url or "720" in label:
-                    ready_direct_url = url
-                    ready_direct_label = label
-            else:
-                if size_mb < smallest_size_above_50:
-                    smallest_size_above_50 = size_mb
-                    compress_candidate_url = url
-                    compress_candidate_label = label
+        if (label, url) not in sorted_candidates:
+            sorted_candidates.append((label, url))
 
-    if ready_direct_url:
-        selected_url = ready_direct_url
-        selected_label = ready_direct_label
-        needs_compression = False
-    elif compress_candidate_url:
-        selected_url = compress_candidate_url
-        selected_label = compress_candidate_label
-        needs_compression = True
-    else:
-        selected_label, selected_url = list(qualities_dict.items())[0]
-        needs_compression = True
+    if not sorted_candidates:
+        print("[-] No valid video streams found in qualities dict.")
+        return fallback_send_text(title, qualities_dict, page_url)
+
+    target_label, target_url = sorted_candidates[0]
+    target_size_mb = get_stream_file_size_mb(target_url)
+
+    print(f"[*] Prioritizing high-quality stream: [{target_label}]" + (f" ({target_size_mb:.2f} MB)" if target_size_mb else ""))
 
     raw_temp_file = f"raw_{int(time.time())}.mp4"
     final_upload_file = f"final_{int(time.time())}.mp4"
 
     try:
-        print(f"[*] Downloading stream [{selected_label}]...")
-        # 60s timeout for download
-        with requests.get(selected_url, headers=HEADERS, stream=True, timeout=60) as r:
-            r.raise_for_status()
-            with open(raw_temp_file, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-
-        initial_size = os.path.getsize(raw_temp_file) / (1024 * 1024)
-        print(f"[*] Download completed ({initial_size:.2f} MB).")
-
-        if initial_size <= 49.0 and not needs_compression:
+        # If target stream is already <= 49MB, upload directly without re-encoding
+        if target_size_mb and target_size_mb <= 49.0:
+            print(f"[*] Stream [{target_label}] is within Telegram limit (<= 49MB). Downloading directly...")
+            with requests.get(target_url, headers=HEADERS, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                with open(raw_temp_file, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
             upload_path = raw_temp_file
-            display_label = selected_label
+            display_label = target_label
         else:
-            success = fast_compress_video(raw_temp_file, final_upload_file)
-            if success:
-                upload_path = final_upload_file
-                display_label = f"{selected_label} (Compressed HD)"
+            # File is > 49MB or size unknown. Download and compress to ~45MB
+            print(f"[*] Stream [{target_label}] exceeds 49MB. Downloading to compress with FFmpeg...")
+            with requests.get(target_url, headers=HEADERS, stream=True, timeout=90) as r:
+                r.raise_for_status()
+                with open(raw_temp_file, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+
+            downloaded_size = os.path.getsize(raw_temp_file) / (1024 * 1024)
+            print(f"[*] Downloaded ({downloaded_size:.2f} MB). Compressing to target ~45MB...")
+
+            if downloaded_size <= 49.0:
+                upload_path = raw_temp_file
+                display_label = target_label
             else:
-                print("[-] Video exceeds 50MB and compression failed.")
-                return fallback_send_text(title, qualities_dict, page_url)
+                success = fast_compress_video(raw_temp_file, final_upload_file, target_mb=45.0)
+                if success:
+                    upload_path = final_upload_file
+                    display_label = f"{target_label} (HD بهینه‌شده)"
+                else:
+                    print("[-] Compression failed. Checking for existing <= 49MB lower-res stream...")
+                    alt_url, alt_label = None, None
+                    for l, u in sorted_candidates[1:]:
+                        sz = get_stream_file_size_mb(u)
+                        if sz and sz <= 49.0:
+                            alt_url, alt_label = u, l
+                            break
+
+                    if alt_url:
+                        print(f"[*] Found alternative stream [{alt_label}] <= 49MB. Downloading...")
+                        with requests.get(alt_url, headers=HEADERS, stream=True, timeout=60) as r:
+                            r.raise_for_status()
+                            with open(raw_temp_file, "wb") as f:
+                                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                                    if chunk:
+                                        f.write(chunk)
+                        upload_path = raw_temp_file
+                        display_label = alt_label
+                    else:
+                        print("[-] No valid stream under 50MB available. Falling back to text links.")
+                        return fallback_send_text(title, qualities_dict, page_url)
 
         upload_size = os.path.getsize(upload_path) / (1024 * 1024)
-        print(f"[*] Uploading playable video ({upload_size:.2f} MB) to Telegram...")
+        print(f"[*] Uploading playable video ({upload_size:.2f} MB) to Telegram channel...")
 
         text_caption = build_caption(title, qualities_dict, page_url, quality_label=display_label)
 
@@ -424,6 +459,9 @@ def upload_video_file_to_telegram(qualities_dict, title, page_url):
                 "parse_mode": "HTML",
                 "supports_streaming": "true"
             }
+            if os.getenv("VIDEO_SPOILER", "false").lower() == "true":
+                data["has_spoiler"] = "true"
+
             response = requests.post(api_url, data=data, files=files, timeout=180)
             res_data = response.json()
 
