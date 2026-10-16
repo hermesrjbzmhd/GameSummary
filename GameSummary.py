@@ -12,6 +12,10 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 # ==================== ENVIRONMENT CONFIGURATION ====================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "-100xxxxxxxxxx")
+CHANNEL_2_ID = os.getenv("CHANNEL_2_ID", "")
+CHANNEL_2_SIGNATURE = os.getenv("CHANNEL_2_SIGNATURE", "")
+CHANNEL_2_INCLUDE_DOWNLOAD_LINKS = os.getenv("CHANNEL_2_INCLUDE_DOWNLOAD_LINKS", "false").lower() == "true"
+CHANNEL_2_INCLUDE_VARZESH3_LINK = os.getenv("CHANNEL_2_INCLUDE_VARZESH3_LINK", "true").lower() == "true"
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "3600"))
 PORT = int(os.getenv("PORT", 8000))
 MAX_VIDEOS_PER_RUN = 5  # Process maximum 5 videos per run to prevent timeout
@@ -275,6 +279,47 @@ def build_caption(title, qualities_dict, page_url, quality_label=""):
     lines.append(f"🔗 <a href='{page_url}'>مشاهده در سایت ورزش سه</a>")
     return "\n".join(lines)
 
+
+def build_caption_channel2(title, qualities_dict, page_url, quality_label=""):
+    """Builds a customized Persian caption for Channel 2."""
+    custom_template = os.getenv("CHANNEL_2_CUSTOM_TEMPLATE")
+    header_text = format_spoiler_title(title)
+
+    if custom_template:
+        return custom_template.replace("{header}", header_text) \
+                               .replace("{title}", title) \
+                               .replace("{quality}", quality_label) \
+                               .replace("{signature}", CHANNEL_2_SIGNATURE) \
+                               .replace("{page_url}", page_url)
+
+    lines = [header_text]
+
+    if quality_label:
+        display_q = quality_label.replace("Compressed HD", "HD بهینه‌شده")
+        lines.append(f"🎬 کیفیت پخش: <b>{display_q}</b>")
+
+    lines.append("")
+
+    if CHANNEL_2_INCLUDE_DOWNLOAD_LINKS and qualities_dict:
+        lines.append("📥 <b>لینک‌های دانلود مستقیم:</b>")
+        for label, url in qualities_dict.items():
+            clean_label = (
+                label.replace("Direct Link", "کیفیت استاندارد")
+                     .replace("Original", "اصلی")
+                     .replace("FHD", "Full HD")
+            )
+            lines.append(f"▫️ <a href='{url}'>{clean_label}</a>")
+        lines.append("")
+
+    if CHANNEL_2_INCLUDE_VARZESH3_LINK:
+        lines.append(f"🔗 <a href='{page_url}'>مشاهده در سایت ورزش سه</a>")
+
+    if CHANNEL_2_SIGNATURE:
+        lines.append(f"\n{CHANNEL_2_SIGNATURE}")
+
+    return "\n".join(lines).strip()
+
+
 def get_stream_file_size_mb(url):
     """Quickly checks file size via HEAD request."""
     try:
@@ -466,7 +511,39 @@ def upload_video_file_to_telegram(qualities_dict, title, page_url):
             res_data = response.json()
 
         if res_data.get("ok"):
-            print(f"[✓] Playable video uploaded successfully to Telegram.")
+            print(f"[✓] Playable video uploaded successfully to primary Telegram channel ({CHANNEL_ID}).")
+            file_id = res_data.get("result", {}).get("video", {}).get("file_id")
+
+            # Dispatch to Channel 2 if configured
+            if CHANNEL_2_ID:
+                try:
+                    print(f"[*] Dispatching video to Channel 2 ({CHANNEL_2_ID})...")
+                    caption_ch2 = build_caption_channel2(title, qualities_dict, page_url, quality_label=display_label)
+                    data_ch2 = {
+                        "chat_id": CHANNEL_2_ID,
+                        "caption": caption_ch2,
+                        "parse_mode": "HTML",
+                        "supports_streaming": "true"
+                    }
+                    if os.getenv("VIDEO_SPOILER", "false").lower() == "true":
+                        data_ch2["has_spoiler"] = "true"
+
+                    # Instant delivery using file_id without re-uploading
+                    if file_id:
+                        data_ch2["video"] = file_id
+                        res_ch2 = requests.post(api_url, data=data_ch2, timeout=30).json()
+                    else:
+                        with open(upload_path, "rb") as vf2:
+                            files2 = {"video": ("highlight.mp4", vf2, "video/mp4")}
+                            res_ch2 = requests.post(api_url, data=data_ch2, files=files2, timeout=180).json()
+
+                    if res_ch2.get("ok"):
+                        print(f"[✓] Playable video sent successfully to Channel 2 ({CHANNEL_2_ID}).")
+                    else:
+                        print(f"[-] Channel 2 upload error: {res_ch2.get('description')}")
+                except Exception as e_ch2:
+                    print(f"[-] Channel 2 dispatch exception: {e_ch2}")
+
             return True
         else:
             print(f"[-] Telegram upload error: {res_data.get('description')}")
@@ -493,12 +570,27 @@ def fallback_send_text(title, qualities_dict, page_url):
         "text": build_caption(title, qualities_dict, page_url),
         "parse_mode": "HTML"
     }
+    primary_success = False
     try:
         res = requests.post(api_url, json=payload, timeout=20)
-        return res.json().get("ok", False)
+        primary_success = res.json().get("ok", False)
     except Exception as e:
-        print(f"[-] Fallback send error: {e}")
-        return False
+        print(f"[-] Fallback send error (Channel 1): {e}")
+
+    if CHANNEL_2_ID:
+        try:
+            payload_ch2 = {
+                "chat_id": CHANNEL_2_ID,
+                "text": build_caption_channel2(title, qualities_dict, page_url),
+                "parse_mode": "HTML"
+            }
+            res_ch2 = requests.post(api_url, json=payload_ch2, timeout=20)
+            if res_ch2.json().get("ok"):
+                print(f"[✓] Fallback text sent to Channel 2 ({CHANNEL_2_ID}).")
+        except Exception as e_ch2:
+            print(f"[-] Fallback send error (Channel 2): {e_ch2}")
+
+    return primary_success
 
 
 def process_varzesh3():

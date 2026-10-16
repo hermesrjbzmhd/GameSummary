@@ -43,6 +43,11 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          CHANNEL_2_ID: ${{ secrets.CHANNEL_2_ID }}
+          CHANNEL_2_SIGNATURE: ${{ secrets.CHANNEL_2_SIGNATURE }}
+          CHANNEL_2_INCLUDE_DOWNLOAD_LINKS: ${{ secrets.CHANNEL_2_INCLUDE_DOWNLOAD_LINKS }}
+          CHANNEL_2_INCLUDE_VARZESH3_LINK: ${{ secrets.CHANNEL_2_INCLUDE_VARZESH3_LINK }}
+          CHANNEL_2_CUSTOM_TEMPLATE: ${{ secrets.CHANNEL_2_CUSTOM_TEMPLATE }}
           RUN_ONCE: "true"
         run: |
           python GameSummary.py
