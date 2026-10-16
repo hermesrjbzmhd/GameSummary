@@ -17,6 +17,7 @@ on:
 
 permissions:
   contents: write
+  workflows: write
 
 jobs:
   run-bot:
@@ -45,17 +46,15 @@ jobs:
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
           CHANNEL_2_ID: ${{ secrets.CHANNEL_2_ID }}
           CHANNEL_2_SIGNATURE: ${{ secrets.CHANNEL_2_SIGNATURE }}
-          CHANNEL_2_INCLUDE_DOWNLOAD_LINKS: ${{ secrets.CHANNEL_2_INCLUDE_DOWNLOAD_LINKS }}
-          CHANNEL_2_INCLUDE_VARZESH3_LINK: ${{ secrets.CHANNEL_2_INCLUDE_VARZESH3_LINK }}
-          CHANNEL_2_CUSTOM_TEMPLATE: ${{ secrets.CHANNEL_2_CUSTOM_TEMPLATE }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
           RUN_ONCE: "true"
         run: |
           python GameSummary.py
 
-      - name: Save sent videos history
+      - name: Save sent videos history and configuration
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add sent_videos.json || true
-          git commit -m "Update sent videos history [skip ci]" || echo "No changes to commit"
+          git add sent_videos.json teams.txt channels.json config.json .github/workflows/bot.yaml || true
+          git commit -m "Update history and configuration [skip ci]" || echo "No changes to commit"
           git push || true

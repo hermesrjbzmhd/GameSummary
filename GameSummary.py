@@ -14,14 +14,16 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "-100xxxxxxxxxx")
 CHANNEL_2_ID = os.getenv("CHANNEL_2_ID", "")
 CHANNEL_2_SIGNATURE = os.getenv("CHANNEL_2_SIGNATURE", "")
-CHANNEL_2_INCLUDE_DOWNLOAD_LINKS = os.getenv("CHANNEL_2_INCLUDE_DOWNLOAD_LINKS", "false").lower() == "true"
-CHANNEL_2_INCLUDE_VARZESH3_LINK = os.getenv("CHANNEL_2_INCLUDE_VARZESH3_LINK", "true").lower() == "true"
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "3600"))
 PORT = int(os.getenv("PORT", 8000))
 MAX_VIDEOS_PER_RUN = 5  # Process maximum 5 videos per run to prevent timeout
 
 TEAMS_FILE = os.getenv("TEAMS_FILE", "teams.txt")
 HISTORY_FILE = os.getenv("HISTORY_FILE", "sent_videos.json")
+CHANNELS_FILE = os.getenv("CHANNELS_FILE", "channels.json")
+CONFIG_FILE = os.getenv("CONFIG_FILE", "config.json")
+WORKFLOW_FILE = os.getenv("WORKFLOW_FILE", ".github/workflows/bot.yaml")
+ADMIN_ID = os.getenv("ADMIN_ID", "")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -29,6 +31,75 @@ HEADERS = {
     "Accept": "*/*"
 }
 # ===================================================================
+
+
+def load_config():
+    """Loads configuration from config.json."""
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_config(cfg):
+    """Saves configuration to config.json."""
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def get_admin_id():
+    """Returns admin Telegram ID from environment or config.json."""
+    if ADMIN_ID:
+        return str(ADMIN_ID).strip()
+    cfg = load_config()
+    return str(cfg.get("admin_id", "")).strip()
+
+
+def load_channels():
+    """Loads configured channels from channels.json or environment variables."""
+    channels = []
+    if os.path.exists(CHANNELS_FILE):
+        try:
+            with open(CHANNELS_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, list):
+                    channels = loaded
+        except Exception as e:
+            print(f"[-] Error reading {CHANNELS_FILE}: {e}")
+
+    existing_ids = {str(c.get("id")) for c in channels if c.get("id")}
+
+    # Default Channel 1 (Full format)
+    if CHANNEL_ID and CHANNEL_ID not in existing_ids and "-100xxxxxxxxxx" not in CHANNEL_ID:
+        channels.insert(0, {
+            "id": CHANNEL_ID,
+            "name": "کانال اصلی",
+            "format": "full",
+            "signature": ""
+        })
+        existing_ids.add(str(CHANNEL_ID))
+
+    # Default Channel 2 (Short format: only states who played against whom)
+    if CHANNEL_2_ID and CHANNEL_2_ID not in existing_ids:
+        channels.append({
+            "id": CHANNEL_2_ID,
+            "name": "کانال دوم",
+            "format": "short",
+            "signature": CHANNEL_2_SIGNATURE
+        })
+        existing_ids.add(str(CHANNEL_2_ID))
+
+    valid = [c for c in channels if c.get("id") and "-100xxxxxxxxxx" not in str(c.get("id"))]
+    return valid
+
+
+def save_channels(channels):
+    """Saves channels configuration to channels.json."""
+    with open(CHANNELS_FILE, "w", encoding="utf-8") as f:
+        json.dump(channels, f, ensure_ascii=False, indent=2)
 
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -56,8 +127,9 @@ def validate_config():
     if not BOT_TOKEN or "YOUR_BOT_TOKEN" in BOT_TOKEN:
         print("[!] Error: BOT_TOKEN is missing.")
         return False
-    if not CHANNEL_ID or "-100xxxxxxxxxx" in CHANNEL_ID:
-        print("[!] Error: CHANNEL_ID is missing.")
+    channels = load_channels()
+    if not channels and (not CHANNEL_ID or "-100xxxxxxxxxx" in CHANNEL_ID):
+        print("[!] Error: No destination channels configured. Please set CHANNEL_ID or configure channels.json.")
         return False
     return True
 
@@ -254,8 +326,53 @@ def format_spoiler_title(title):
     return f"⚽️ <b>{title}</b>"
 
 
-def build_caption(title, qualities_dict, page_url, quality_label=""):
-    """Builds a clean, professional Persian Telegram caption with spoiler result."""
+def extract_teams_matchup(title):
+    """Extracts 'Team A 🆚 Team B' from title without match score."""
+    clean = re.sub(r"^خلاصه\s+بازی\s*", "", title).strip()
+    m1 = re.match(r"^(.*?)\s+(\d+)\s*[-–—]\s*(.*?)\s+(\d+)$", clean)
+    if m1:
+        return f"⚽️ <b>خلاصه بازی {m1.group(1).strip()} 🆚 {m1.group(3).strip()}</b>"
+    m2 = re.match(r"^(.*?)\s+(\d+)\s*[-–—]\s*(\d+)\s+(.*)$", clean)
+    if m2:
+        return f"⚽️ <b>خلاصه بازی {m2.group(1).strip()} 🆚 {m2.group(4).strip()}</b>"
+    clean_score = re.sub(r"\d+\s*[-–—]\s*\d+", "", clean).strip()
+    return f"⚽️ <b>خلاصه بازی {clean_score}</b>"
+
+
+def format_channel_caption(title, qualities_dict, page_url, quality_label="", channel_cfg=None):
+    """
+    Builds customized Telegram caption based on channel format:
+    - 'short': Ultra-short: only who played against whom (+ optional signature). Default for Channel 2.
+    - 'full': Matchup + Spoiler score + Quality + Direct download links + Varzesh3 link (+ signature). Default for Channel 1.
+    - 'no_links': Matchup + Spoiler score + Quality + Varzesh3 link (+ signature).
+    - 'custom': User-defined template.
+    """
+    if channel_cfg is None:
+        channel_cfg = {"format": "full"}
+
+    fmt = channel_cfg.get("format", "full").lower()
+    signature = channel_cfg.get("signature", "").strip()
+    custom_template = channel_cfg.get("custom_template")
+
+    if fmt == "custom" and custom_template:
+        header_text = format_spoiler_title(title)
+        matchup_text = extract_teams_matchup(title)
+        return custom_template.replace("{header}", header_text) \
+                               .replace("{matchup}", matchup_text) \
+                               .replace("{title}", title) \
+                               .replace("{quality}", quality_label) \
+                               .replace("{signature}", signature) \
+                               .replace("{page_url}", page_url).strip()
+
+    if fmt == "short":
+        # Ultra-short format: only state who played against whom!
+        matchup_text = extract_teams_matchup(title)
+        lines = [matchup_text]
+        if signature:
+            lines.append("")
+            lines.append(signature)
+        return "\n".join(lines).strip()
+
     header_text = format_spoiler_title(title)
     lines = [header_text]
 
@@ -263,9 +380,9 @@ def build_caption(title, qualities_dict, page_url, quality_label=""):
         display_q = quality_label.replace("Compressed HD", "HD بهینه‌شده")
         lines.append(f"🎬 کیفیت پخش: <b>{display_q}</b>")
 
-    lines.append("")  # Empty line for spacing
+    lines.append("")  # spacing
 
-    if qualities_dict:
+    if fmt == "full" and qualities_dict:
         lines.append("📥 <b>لینک‌های دانلود مستقیم:</b>")
         for label, url in qualities_dict.items():
             clean_label = (
@@ -277,47 +394,25 @@ def build_caption(title, qualities_dict, page_url, quality_label=""):
         lines.append("")
 
     lines.append(f"🔗 <a href='{page_url}'>مشاهده در سایت ورزش سه</a>")
-    return "\n".join(lines)
+
+    if signature:
+        lines.append("")
+        lines.append(signature)
+
+    return "\n".join(lines).strip()
+
+
+def build_caption(title, qualities_dict, page_url, quality_label=""):
+    """Builds full caption (default for Channel 1)."""
+    return format_channel_caption(title, qualities_dict, page_url, quality_label, {"format": "full"})
 
 
 def build_caption_channel2(title, qualities_dict, page_url, quality_label=""):
-    """Builds a customized Persian caption for Channel 2."""
-    custom_template = os.getenv("CHANNEL_2_CUSTOM_TEMPLATE")
-    header_text = format_spoiler_title(title)
-
-    if custom_template:
-        return custom_template.replace("{header}", header_text) \
-                               .replace("{title}", title) \
-                               .replace("{quality}", quality_label) \
-                               .replace("{signature}", CHANNEL_2_SIGNATURE) \
-                               .replace("{page_url}", page_url)
-
-    lines = [header_text]
-
-    if quality_label:
-        display_q = quality_label.replace("Compressed HD", "HD بهینه‌شده")
-        lines.append(f"🎬 کیفیت پخش: <b>{display_q}</b>")
-
-    lines.append("")
-
-    if CHANNEL_2_INCLUDE_DOWNLOAD_LINKS and qualities_dict:
-        lines.append("📥 <b>لینک‌های دانلود مستقیم:</b>")
-        for label, url in qualities_dict.items():
-            clean_label = (
-                label.replace("Direct Link", "کیفیت استاندارد")
-                     .replace("Original", "اصلی")
-                     .replace("FHD", "Full HD")
-            )
-            lines.append(f"▫️ <a href='{url}'>{clean_label}</a>")
-        lines.append("")
-
-    if CHANNEL_2_INCLUDE_VARZESH3_LINK:
-        lines.append(f"🔗 <a href='{page_url}'>مشاهده در سایت ورزش سه</a>")
-
-    if CHANNEL_2_SIGNATURE:
-        lines.append(f"\n{CHANNEL_2_SIGNATURE}")
-
-    return "\n".join(lines).strip()
+    """Builds short caption (default for Channel 2)."""
+    return format_channel_caption(title, qualities_dict, page_url, quality_label, {
+        "format": "short",
+        "signature": CHANNEL_2_SIGNATURE
+    })
 
 
 def get_stream_file_size_mb(url):
@@ -492,15 +587,22 @@ def upload_video_file_to_telegram(qualities_dict, title, page_url):
                         return fallback_send_text(title, qualities_dict, page_url)
 
         upload_size = os.path.getsize(upload_path) / (1024 * 1024)
-        print(f"[*] Uploading playable video ({upload_size:.2f} MB) to Telegram channel...")
 
-        text_caption = build_caption(title, qualities_dict, page_url, quality_label=display_label)
+        channels = load_channels()
+        if not channels:
+            print("[-] No valid channels configured for upload.")
+            return False
+
+        first_channel = channels[0]
+        first_caption = format_channel_caption(title, qualities_dict, page_url, display_label, first_channel)
+
+        print(f"[*] Uploading playable video ({upload_size:.2f} MB) to {first_channel.get('name', first_channel['id'])}...")
 
         with open(upload_path, "rb") as video_file:
             files = {"video": ("highlight.mp4", video_file, "video/mp4")}
             data = {
-                "chat_id": CHANNEL_ID,
-                "caption": text_caption,
+                "chat_id": first_channel["id"],
+                "caption": first_caption,
                 "parse_mode": "HTML",
                 "supports_streaming": "true"
             }
@@ -511,38 +613,40 @@ def upload_video_file_to_telegram(qualities_dict, title, page_url):
             res_data = response.json()
 
         if res_data.get("ok"):
-            print(f"[✓] Playable video uploaded successfully to primary Telegram channel ({CHANNEL_ID}).")
+            print(f"[✓] Uploaded successfully to {first_channel.get('name', first_channel['id'])}.")
             file_id = res_data.get("result", {}).get("video", {}).get("file_id")
 
-            # Dispatch to Channel 2 if configured
-            if CHANNEL_2_ID:
+            # Dispatch to all other channels using file_id!
+            for ch in channels[1:]:
+                ch_id = ch.get("id")
+                ch_name = ch.get("name", ch_id)
+                ch_fmt = ch.get("format", "short")
                 try:
-                    print(f"[*] Dispatching video to Channel 2 ({CHANNEL_2_ID})...")
-                    caption_ch2 = build_caption_channel2(title, qualities_dict, page_url, quality_label=display_label)
-                    data_ch2 = {
-                        "chat_id": CHANNEL_2_ID,
-                        "caption": caption_ch2,
+                    print(f"[*] Dispatching video to {ch_name} ({ch_id}) [Format: {ch_fmt}]...")
+                    ch_caption = format_channel_caption(title, qualities_dict, page_url, display_label, ch)
+                    ch_data = {
+                        "chat_id": ch_id,
+                        "caption": ch_caption,
                         "parse_mode": "HTML",
                         "supports_streaming": "true"
                     }
                     if os.getenv("VIDEO_SPOILER", "false").lower() == "true":
-                        data_ch2["has_spoiler"] = "true"
+                        ch_data["has_spoiler"] = "true"
 
-                    # Instant delivery using file_id without re-uploading
                     if file_id:
-                        data_ch2["video"] = file_id
-                        res_ch2 = requests.post(api_url, data=data_ch2, timeout=30).json()
+                        ch_data["video"] = file_id
+                        res_ch = requests.post(api_url, data=ch_data, timeout=30).json()
                     else:
                         with open(upload_path, "rb") as vf2:
                             files2 = {"video": ("highlight.mp4", vf2, "video/mp4")}
-                            res_ch2 = requests.post(api_url, data=data_ch2, files=files2, timeout=180).json()
+                            res_ch = requests.post(api_url, data=ch_data, files=files2, timeout=180).json()
 
-                    if res_ch2.get("ok"):
-                        print(f"[✓] Playable video sent successfully to Channel 2 ({CHANNEL_2_ID}).")
+                    if res_ch.get("ok"):
+                        print(f"[✓] Playable video sent successfully to {ch_name}.")
                     else:
-                        print(f"[-] Channel 2 upload error: {res_ch2.get('description')}")
-                except Exception as e_ch2:
-                    print(f"[-] Channel 2 dispatch exception: {e_ch2}")
+                        print(f"[-] Error sending to {ch_name}: {res_ch.get('description')}")
+                except Exception as e_ch:
+                    print(f"[-] Dispatch error for {ch_name}: {e_ch}")
 
             return True
         else:
@@ -563,34 +667,30 @@ def upload_video_file_to_telegram(qualities_dict, title, page_url):
 
 
 def fallback_send_text(title, qualities_dict, page_url):
-    """Sends a text message with clean download links if video upload fails."""
+    """Sends a text message with clean download links if video upload fails to all channels."""
     api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHANNEL_ID,
-        "text": build_caption(title, qualities_dict, page_url),
-        "parse_mode": "HTML"
-    }
-    primary_success = False
-    try:
-        res = requests.post(api_url, json=payload, timeout=20)
-        primary_success = res.json().get("ok", False)
-    except Exception as e:
-        print(f"[-] Fallback send error (Channel 1): {e}")
+    channels = load_channels()
+    if not channels:
+        return False
 
-    if CHANNEL_2_ID:
+    success = False
+    for i, ch in enumerate(channels):
+        caption = format_channel_caption(title, qualities_dict, page_url, "", ch)
+        payload = {
+            "chat_id": ch["id"],
+            "text": caption,
+            "parse_mode": "HTML"
+        }
         try:
-            payload_ch2 = {
-                "chat_id": CHANNEL_2_ID,
-                "text": build_caption_channel2(title, qualities_dict, page_url),
-                "parse_mode": "HTML"
-            }
-            res_ch2 = requests.post(api_url, json=payload_ch2, timeout=20)
-            if res_ch2.json().get("ok"):
-                print(f"[✓] Fallback text sent to Channel 2 ({CHANNEL_2_ID}).")
-        except Exception as e_ch2:
-            print(f"[-] Fallback send error (Channel 2): {e_ch2}")
+            res = requests.post(api_url, json=payload, timeout=20)
+            if res.json().get("ok"):
+                if i == 0:
+                    success = True
+                print(f"[✓] Fallback text sent to {ch.get('name', ch['id'])}.")
+        except Exception as e:
+            print(f"[-] Fallback send error ({ch.get('id')}): {e}")
 
-    return primary_success
+    return success
 
 
 def process_varzesh3():
@@ -649,6 +749,259 @@ def process_varzesh3():
         print(f"[-] Scraping error: {e}")
 
 
+def send_telegram_admin_message(chat_id, text):
+    """Sends a formatted message to admin chat."""
+    api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML"
+    }
+    try:
+        requests.post(api_url, json=payload, timeout=15)
+    except Exception as e:
+        print(f"[-] Error sending admin message: {e}")
+
+
+def update_workflow_interval(interval_str):
+    """Updates the cron schedule in bot.yaml."""
+    if not os.path.exists(WORKFLOW_FILE):
+        return False, "فایل ورک‌فلو (.github/workflows/bot.yaml) یافت نشد."
+
+    cron_map = {
+        "15m": "*/15 * * * *",
+        "30m": "*/30 * * * *",
+        "1h": "15 * * * *",
+        "2h": "15 */2 * * *",
+        "3h": "15 */3 * * *",
+        "6h": "15 */6 * * *",
+        "12h": "15 */12 * * *",
+        "24h": "0 3 * * *"
+    }
+    interval_clean = interval_str.strip().lower()
+    if interval_clean not in cron_map:
+        return False, f"فرمت نامعتبر است. بازه‌های مجاز: {', '.join(cron_map.keys())}"
+
+    new_cron = cron_map[interval_clean]
+    try:
+        with open(WORKFLOW_FILE, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        pattern = r"(- cron:\s*['\"][^'\"]+['\"])"
+        new_content, count = re.subn(pattern, f"- cron: '{new_cron}'", content, count=1)
+        if count == 0:
+            return False, "الگوی cron در فایل bot.yaml پیدا نشد."
+
+        with open(WORKFLOW_FILE, "w", encoding="utf-8") as f:
+            f.write(new_content)
+
+        return True, f"زمان‌بندی اجرا به <b>{interval_clean}</b> (<code>{new_cron}</code>) تغییر یافت."
+    except Exception as e:
+        return False, f"خطا در ویرایش فایل ورک‌فلو: {e}"
+
+
+def process_telegram_admin_commands():
+    """Fetches and executes pending admin commands from Telegram."""
+    if not BOT_TOKEN or "YOUR_BOT_TOKEN" in BOT_TOKEN:
+        return
+
+    config = load_config()
+    last_update_id = config.get("last_update_id", 0)
+    current_admin_id = get_admin_id()
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+    params = {"offset": last_update_id + 1, "timeout": 2}
+
+    try:
+        res = requests.get(url, params=params, timeout=10)
+        data = res.json()
+        if not data.get("ok"):
+            return
+
+        updates = data.get("result", [])
+        if not updates:
+            return
+
+        for update in updates:
+            update_id = update["update_id"]
+            if update_id > last_update_id:
+                last_update_id = update_id
+
+            message = update.get("message")
+            if not message or "text" not in message:
+                continue
+
+            chat_id = message["chat"]["id"]
+            from_id = str(message.get("from", {}).get("id", ""))
+            text = message["text"].strip()
+
+            # Handle /setadmin command
+            if text.lower() == "/setadmin":
+                config["admin_id"] = from_id
+                save_config(config)
+                current_admin_id = from_id
+                send_telegram_admin_message(chat_id, f"✅ شما با آیدی عددی <code>{from_id}</code> به عنوان ادمین ثبت شدید!\n\nاکنون می‌توانید از دستور <code>/admin</code> برای مدیریت استفاده کنید.")
+                continue
+
+            # Check admin permission
+            if current_admin_id and from_id != current_admin_id:
+                send_telegram_admin_message(chat_id, "⛔️ شما دسترسی ادمین برای مدیریت این ربات را ندارید.")
+                continue
+            elif not current_admin_id:
+                send_telegram_admin_message(chat_id, f"⚠️ هنوز ادمینی برای ربات ثبت نشده است.\n\nبرای ثبت خود به عنوان ادمین، دستور <code>/setadmin</code> را بفرستید.")
+                continue
+
+            # Command routing
+            parts = text.split(maxsplit=2)
+            cmd = parts[0].lower()
+
+            if cmd in ["/start", "/help", "/panel", "/admin"]:
+                help_text = (
+                    "⚽️ <b>پنل مدیریت ربات خلاصه بازی‌ها</b>\n\n"
+                    "📋 <b>مدیریت تیم‌ها:</b>\n"
+                    "▫️ <code>/teams</code> : مشاهده لیست تیم‌ها\n"
+                    "▫️ <code>/addteam &lt;نام&gt;</code> : افزودن تیم (مثال: <code>/addteam میلان</code>)\n"
+                    "▫️ <code>/delteam &lt;نام&gt;</code> : حذف تیم\n\n"
+                    "📢 <b>مدیریت کانال‌ها:</b>\n"
+                    "▫️ <code>/channels</code> : لیست کانال‌های فعال و فرمت‌ها\n"
+                    "▫️ <code>/addchannel &lt;chat_id&gt; [short|full|no_links] [امضا]</code>\n"
+                    "▫️ <code>/delchannel &lt;chat_id&gt;</code> : حذف کانال\n"
+                    "▫️ <code>/setformat &lt;chat_id&gt; &lt;short|full|no_links&gt;</code> : تغییر فرمت\n\n"
+                    "⏱ <b>تنظیم زمان‌بندی (گیت‌هاب اکشنز):</b>\n"
+                    "▫️ <code>/interval &lt;30m|1h|2h|3h&gt;</code> : تغییر فاصله اجرا\n\n"
+                    "🚀 <b>اجرای فوری:</b>\n"
+                    "▫️ <code>/check</code> : بررسی فوری و ارسال مسابقات جدید"
+                )
+                send_telegram_admin_message(chat_id, help_text)
+
+            elif cmd == "/teams":
+                teams = load_target_teams()
+                if not teams:
+                    send_telegram_admin_message(chat_id, "هیچ تیمی در لیست مانیتورینگ نیست.")
+                else:
+                    teams_list = "\n".join([f"{i+1}. {t}" for i, t in enumerate(teams)])
+                    send_telegram_admin_message(chat_id, f"📋 <b>لیست تیم‌های تحت نظارت ({len(teams)} تیم):</b>\n\n{teams_list}")
+
+            elif cmd == "/addteam":
+                if len(parts) < 2:
+                    send_telegram_admin_message(chat_id, "لطفاً نام تیم را وارد کنید:\n<code>/addteam میلان</code>")
+                else:
+                    team_name = text[len(cmd):].strip()
+                    with open(TEAMS_FILE, "a", encoding="utf-8") as f:
+                        f.write(f"\n{team_name}\n")
+                    send_telegram_admin_message(chat_id, f"✅ تیم <b>{team_name}</b> به لیست اضافه شد.")
+
+            elif cmd == "/delteam":
+                if len(parts) < 2:
+                    send_telegram_admin_message(chat_id, "لطفاً نام تیم برای حذف را وارد کنید:\n<code>/delteam میلان</code>")
+                else:
+                    del_name = normalize_text(text[len(cmd):].strip())
+                    lines = []
+                    found = False
+                    if os.path.exists(TEAMS_FILE):
+                        with open(TEAMS_FILE, "r", encoding="utf-8") as f:
+                            for l in f:
+                                if normalize_text(l.strip()) == del_name:
+                                    found = True
+                                else:
+                                    lines.append(l)
+                        with open(TEAMS_FILE, "w", encoding="utf-8") as f:
+                            f.writelines(lines)
+                    if found:
+                        send_telegram_admin_message(chat_id, f"❌ تیم <b>{text[len(cmd):].strip()}</b> از لیست حذف شد.")
+                    else:
+                        send_telegram_admin_message(chat_id, "تیم مورد نظر در لیست پیدا نشد.")
+
+            elif cmd == "/channels":
+                channels = load_channels()
+                if not channels:
+                    send_telegram_admin_message(chat_id, "هیچ کانالی تنظیم نشده است.\nبا دستور <code>/addchannel</code> کانال اضافه کنید.")
+                else:
+                    ch_lines = []
+                    for i, ch in enumerate(channels):
+                        fmt = ch.get("format", "full")
+                        sig = ch.get("signature") or "ندارد"
+                        ch_lines.append(f"{i+1}. <b>{ch.get('name', 'کانال')}</b> (<code>{ch.get('id')}</code>)\n   ▫️ فرمت: <code>{fmt}</code> | امضا: <code>{sig}</code>")
+                    send_telegram_admin_message(chat_id, f"📢 <b>کانال‌های فعال ({len(channels)} کانال):</b>\n\n" + "\n\n".join(ch_lines))
+
+            elif cmd == "/addchannel":
+                sub_parts = text.split()
+                if len(sub_parts) < 2:
+                    send_telegram_admin_message(chat_id, "فرمت دستور:\n<code>/addchannel &lt;chat_id&gt; [short|full|no_links] [signature]</code>\n\nمثال:\n<code>/addchannel -1001234567890 short 🆔 @MyChannel</code>")
+                else:
+                    new_id = sub_parts[1].strip()
+                    fmt = sub_parts[2].lower() if len(sub_parts) > 2 and sub_parts[2].lower() in ["short", "full", "no_links", "custom"] else "short"
+                    sig = " ".join(sub_parts[3:]) if len(sub_parts) > 3 else ""
+                    channels = load_channels()
+                    channels = [c for c in channels if str(c.get("id")) != new_id]
+                    channels.append({
+                        "id": new_id,
+                        "name": f"کانال {len(channels) + 1}",
+                        "format": fmt,
+                        "signature": sig
+                    })
+                    save_channels(channels)
+                    send_telegram_admin_message(chat_id, f"✅ کانال <code>{new_id}</code> با فرمت <b>{fmt}</b> به لیست کانال‌ها اضافه شد.")
+
+            elif cmd == "/delchannel":
+                if len(parts) < 2:
+                    send_telegram_admin_message(chat_id, "فرمت دستور:\n<code>/delchannel &lt;chat_id&gt;</code>")
+                else:
+                    target_id = parts[1].strip()
+                    channels = load_channels()
+                    new_channels = [c for c in channels if str(c.get("id")) != target_id]
+                    save_channels(new_channels)
+                    send_telegram_admin_message(chat_id, f"❌ کانال <code>{target_id}</code> حذف شد.")
+
+            elif cmd == "/setformat":
+                sub_parts = text.split()
+                if len(sub_parts) < 3:
+                    send_telegram_admin_message(chat_id, "فرمت دستور:\n<code>/setformat &lt;chat_id&gt; &lt;short|full|no_links&gt;</code>")
+                else:
+                    target_id = sub_parts[1].strip()
+                    new_fmt = sub_parts[2].lower()
+                    channels = load_channels()
+                    updated = False
+                    for ch in channels:
+                        if str(ch.get("id")) == target_id:
+                            ch["format"] = new_fmt
+                            updated = True
+                    if updated:
+                        save_channels(channels)
+                        send_telegram_admin_message(chat_id, f"✅ فرمت کانال <code>{target_id}</code> به <b>{new_fmt}</b> تغییر یافت.")
+                    else:
+                        send_telegram_admin_message(chat_id, "کانال مورد نظر در لیست یافت نشد.")
+
+            elif cmd == "/interval":
+                if len(parts) < 2:
+                    send_telegram_admin_message(chat_id, "فرمت دستور:\n<code>/interval &lt;30m|1h|2h|3h&gt;</code>\n\nمثال: <code>/interval 2h</code>")
+                else:
+                    success, msg = update_workflow_interval(parts[1].strip())
+                    send_telegram_admin_message(chat_id, msg)
+
+            elif cmd == "/check":
+                send_telegram_admin_message(chat_id, "🔄 در حال بررسی سایت ورزش ۳...")
+                process_varzesh3()
+                send_telegram_admin_message(chat_id, "✅ بررسی ورزش ۳ به پایان رسید.")
+
+        config["last_update_id"] = last_update_id
+        save_config(config)
+
+    except Exception as e:
+        print(f"[-] Error processing telegram admin commands: {e}")
+
+
+def admin_polling_worker():
+    """Background worker that continuously listens for admin commands in daemon mode."""
+    print("[*] Admin Telegram polling worker started.")
+    while True:
+        try:
+            process_telegram_admin_commands()
+        except Exception as e:
+            print(f"[-] Admin polling error: {e}")
+        time.sleep(2)
+
+
 # ==================== MAIN ENTRY POINT ====================
 if __name__ == "__main__":
     if not validate_config():
@@ -656,9 +1009,14 @@ if __name__ == "__main__":
 
     if os.getenv("RUN_ONCE") == "true":
         print("=== Running in Single-Execution Mode (GitHub Actions) ===")
+        # Process any pending admin commands before checking matches
+        process_telegram_admin_commands()
         process_varzesh3()
+        # Process any commands that arrived during the run
+        process_telegram_admin_commands()
     else:
         threading.Thread(target=run_health_check_server, daemon=True).start()
+        threading.Thread(target=admin_polling_worker, daemon=True).start()
         print(f"[*] Health check server running on port {PORT}.")
         print("=== Varzesh3 Highlights Bot started successfully ===")
         while True:
