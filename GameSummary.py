@@ -10,10 +10,23 @@ from bs4 import BeautifulSoup
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ==================== ENVIRONMENT CONFIGURATION ====================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-CHANNEL_ID = os.getenv("CHANNEL_ID", "-100xxxxxxxxxx")
-CHANNEL_2_ID = os.getenv("CHANNEL_2_ID", "")
+BOT_TOKEN = (
+    os.getenv("BOT_TOKEN")
+    or os.getenv("TELEGRAM_BOT_TOKEN")
+    or "YOUR_BOT_TOKEN_HERE"
+)
+CHANNEL_ID = (
+    os.getenv("CHANNEL_ID")
+    or os.getenv("TELEGRAM_CHANNEL_ID")
+    or "-100xxxxxxxxxx"
+)
+CHANNEL_2_ID = (
+    os.getenv("CHANNEL_2_ID")
+    or os.getenv("TELEGRAM_CHANNEL_2_ID")
+    or ""
+)
 CHANNEL_2_SIGNATURE = os.getenv("CHANNEL_2_SIGNATURE", "")
+CHANNEL_2_FORMAT = os.getenv("CHANNEL_2_FORMAT", "short")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "3600"))
 PORT = int(os.getenv("PORT", 8000))
 MAX_VIDEOS_PER_RUN = 5  # Process maximum 5 videos per run to prevent timeout
@@ -23,7 +36,12 @@ HISTORY_FILE = os.getenv("HISTORY_FILE", "sent_videos.json")
 CHANNELS_FILE = os.getenv("CHANNELS_FILE", "channels.json")
 CONFIG_FILE = os.getenv("CONFIG_FILE", "config.json")
 WORKFLOW_FILE = os.getenv("WORKFLOW_FILE", ".github/workflows/bot.yaml")
-ADMIN_ID = os.getenv("ADMIN_ID", "")
+ADMIN_ID = (
+    os.getenv("ADMIN_ID")
+    or os.getenv("ADMIN_CHAT_ID")
+    or os.getenv("TELEGRAM_ADMIN_ID")
+    or ""
+)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -52,8 +70,14 @@ def save_config(cfg):
 
 def get_admin_id():
     """Returns admin Telegram ID from environment or config.json."""
-    if ADMIN_ID:
-        return str(ADMIN_ID).strip()
+    env_admin = (
+        os.getenv("ADMIN_ID")
+        or os.getenv("ADMIN_CHAT_ID")
+        or os.getenv("TELEGRAM_ADMIN_ID")
+        or ADMIN_ID
+    )
+    if env_admin:
+        return str(env_admin).strip()
     cfg = load_config()
     return str(cfg.get("admin_id", "")).strip()
 
@@ -61,39 +85,61 @@ def get_admin_id():
 def load_channels():
     """Loads configured channels from channels.json or environment variables."""
     channels = []
+    existing_ids = set()
+
+    # 1. From channels.json file
     if os.path.exists(CHANNELS_FILE):
         try:
             with open(CHANNELS_FILE, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
                 if isinstance(loaded, list):
-                    channels = loaded
+                    for ch in loaded:
+                        cid = str(ch.get("id", "")).strip()
+                        if cid and "-100xxxxxxxxxx" not in cid and cid not in existing_ids:
+                            channels.append(ch)
+                            existing_ids.add(cid)
         except Exception as e:
             print(f"[-] Error reading {CHANNELS_FILE}: {e}")
 
-    existing_ids = {str(c.get("id")) for c in channels if c.get("id")}
-
-    # Default Channel 1 (Full format)
-    if CHANNEL_ID and CHANNEL_ID not in existing_ids and "-100xxxxxxxxxx" not in CHANNEL_ID:
+    # 2. Main Channel (Channel 1) from environment
+    ch1_id = os.getenv("CHANNEL_ID") or os.getenv("TELEGRAM_CHANNEL_ID") or CHANNEL_ID
+    if ch1_id and str(ch1_id).strip() not in existing_ids and "-100xxxxxxxxxx" not in str(ch1_id):
         channels.insert(0, {
-            "id": CHANNEL_ID,
+            "id": str(ch1_id).strip(),
             "name": "کانال اصلی",
             "format": "full",
             "signature": ""
         })
-        existing_ids.add(str(CHANNEL_ID))
+        existing_ids.add(str(ch1_id).strip())
 
-    # Default Channel 2 (Short format: only states who played against whom)
-    if CHANNEL_2_ID and CHANNEL_2_ID not in existing_ids:
+    # 3. Channel 2 from environment (default short format)
+    ch2_id = os.getenv("CHANNEL_2_ID") or os.getenv("TELEGRAM_CHANNEL_2_ID") or CHANNEL_2_ID
+    if ch2_id and str(ch2_id).strip() not in existing_ids:
+        ch2_sig = os.getenv("CHANNEL_2_SIGNATURE", CHANNEL_2_SIGNATURE)
+        ch2_fmt = os.getenv("CHANNEL_2_FORMAT", CHANNEL_2_FORMAT)
         channels.append({
-            "id": CHANNEL_2_ID,
+            "id": str(ch2_id).strip(),
             "name": "کانال دوم",
-            "format": "short",
-            "signature": CHANNEL_2_SIGNATURE
+            "format": ch2_fmt,
+            "signature": ch2_sig
         })
-        existing_ids.add(str(CHANNEL_2_ID))
+        existing_ids.add(str(ch2_id).strip())
 
-    valid = [c for c in channels if c.get("id") and "-100xxxxxxxxxx" not in str(c.get("id"))]
-    return valid
+    # 4. Custom CHANNELS_JSON env var
+    env_channels = os.getenv("CHANNELS_JSON")
+    if env_channels:
+        try:
+            parsed = json.loads(env_channels)
+            if isinstance(parsed, list):
+                for ch in parsed:
+                    cid = str(ch.get("id", "")).strip()
+                    if cid and cid not in existing_ids:
+                        channels.append(ch)
+                        existing_ids.add(cid)
+        except Exception as e:
+            print(f"[-] Error parsing CHANNELS_JSON env var: {e}")
+
+    return [c for c in channels if c.get("id") and "-100xxxxxxxxxx" not in str(c.get("id"))]
 
 
 def save_channels(channels):
@@ -178,8 +224,8 @@ def load_target_teams():
             f.write("\n".join(default_teams))
         teams = [normalize_text(t) for t in default_teams]
 
-    # Support adding or overriding teams via environment variable TEAMS (comma or newline separated)
-    env_teams = os.getenv("TEAMS")
+    # Support adding or overriding teams via environment variable TARGET_TEAMS / TEAMS
+    env_teams = os.getenv("TARGET_TEAMS") or os.getenv("TEAMS")
     if env_teams:
         for t in env_teams.replace("\n", ",").split(","):
             cleaned = t.strip()
@@ -751,8 +797,7 @@ def process_varzesh3():
 
 MAIN_REPLY_KEYBOARD = {
     "keyboard": [
-        [{"text": "🎛 پنل مدیریت"}, {"text": "🚀 بررسی فوری"}],
-        [{"text": "📋 تیم‌های تحت مانیتور"}, {"text": "📢 کانال‌های متصل"}]
+        [{"text": "🎛 پنل مدیریت"}, {"text": "🚀 بررسی فوری"}]
     ],
     "resize_keyboard": True
 }
@@ -772,41 +817,48 @@ def get_interval_display(seconds):
     return mapping.get(seconds, f"{seconds // 60} دقیقه")
 
 
-def build_panel_inline_keyboard(current_seconds=None):
+def build_main_dashboard_keyboard():
+    """Clean, categorized main panel with only 3 rows."""
+    return {
+        "inline_keyboard": [
+            [{"text": "⏱ تنظیم زمان‌بندی بررسی", "callback_data": "menu:interval"}],
+            [{"text": "🚀 بررسی فوری مسابقات ورزش ۳", "callback_data": "menu:check"}],
+            [
+                {"text": "📋 مشاهده تیم‌ها", "callback_data": "menu:teams"},
+                {"text": "📢 مشاهده کانال‌ها", "callback_data": "menu:channels"}
+            ]
+        ]
+    }
+
+
+def build_interval_submenu_keyboard(current_seconds=None):
+    """Submenu specifically for changing check interval."""
     if current_seconds is None:
         current_seconds = CHECK_INTERVAL
 
     intervals = [
-        [("15m", "۱۵ دقیقه", 900), ("30m", "۳۰ دقیقه", 1800), ("1h", "۱ ساعت", 3600)],
-        [("2h", "۲ ساعت", 7200), ("3h", "۳ ساعت", 10800), ("6h", "۶ ساعت", 21600)]
+        [("15m", "۱۵ دقیقه", 900), ("30m", "۳۰ دقیقه", 1800)],
+        [("1h", "۱ ساعت", 3600), ("2h", "۲ ساعت", 7200)],
+        [("3h", "۳ ساعت", 10800), ("6h", "۶ ساعت", 21600)]
     ]
 
-    keyboard = [
-        [{"text": "🚀 بررسی فوری مسابقات ورزش ۳", "callback_data": "act:check"}]
-    ]
-
+    keyboard = []
     for row in intervals:
         kb_row = []
         for code, label, sec in row:
             txt = f"✅ {label}" if sec == current_seconds else f"⏱ {label}"
-            kb_row.append({"text": txt, "callback_data": f"interval:{code}"})
+            kb_row.append({"text": txt, "callback_data": f"set_interval:{code}"})
         keyboard.append(kb_row)
 
-    keyboard.append([
-        {"text": "📋 تیم‌های تحت مانیتور", "callback_data": "act:teams"},
-        {"text": "📢 کانال‌های متصل", "callback_data": "act:channels"}
-    ])
-    keyboard.append([
-        {"text": "🔄 بروزرسانی وضعیت", "callback_data": "act:refresh"}
-    ])
-
+    keyboard.append([{"text": "🔙 بازگشت به پنل اصلی", "callback_data": "menu:home"}])
     return {"inline_keyboard": keyboard}
 
 
-def build_back_inline_keyboard():
+def build_back_keyboard():
+    """Simple back button for detail views."""
     return {
         "inline_keyboard": [
-            [{"text": "🔙 بازگشت به پنل کنترل", "callback_data": "act:home"}]
+            [{"text": "🔙 بازگشت به پنل اصلی", "callback_data": "menu:home"}]
         ]
     }
 
@@ -817,13 +869,22 @@ def get_dashboard_text():
     interval_str = get_interval_display(CHECK_INTERVAL)
 
     text = (
-        "⚽️ <b>پنل کنترل ربات خلاصه بازی‌ها</b>\n\n"
+        "⚽️ <b>پنل مدیریت ربات خلاصه بازی‌ها</b>\n\n"
         f"⏱ <b>فاصله بررسی خودکار:</b> <code>{interval_str}</code>\n"
-        f"📋 <b>تعداد تیم‌های مانیتور شده:</b> <code>{len(teams)} تیم</code>\n"
-        f"📢 <b>تعداد کانال‌های متصل:</b> <code>{len(channels)} کانال</code>\n\n"
-        "👇 <b>برای تغییر زمان‌بندی بررسی، مستقیماً روی دکمه مورد نظر کلیک کنید:</b>"
+        f"📋 <b>تیم‌های تحت مانیتور:</b> <code>{len(teams)} تیم</code>\n"
+        f"📢 <b>کانال‌های متصل:</b> <code>{len(channels)} کانال</code>\n\n"
+        "👇 <i>بخش مورد نظر خود را انتخاب کنید:</i>"
     )
     return text
+
+
+def get_interval_submenu_text():
+    interval_str = get_interval_display(CHECK_INTERVAL)
+    return (
+        "⏱ <b>تنظیم زمان‌بندی بررسی ورزش ۳</b>\n\n"
+        f"فاصله بررسی فعلی: <code>{interval_str}</code>\n\n"
+        "👇 <i>برای تغییر فاصله بررسی، روی زمان مورد نظر کلیک کنید:</i>"
+    )
 
 
 def get_teams_text():
@@ -834,24 +895,30 @@ def get_teams_text():
     return (
         f"📋 <b>لیست تیم‌های تحت نظارت ({len(teams)} تیم):</b>\n\n"
         f"{teams_list}\n\n"
-        "💡 <i>تیم‌ها از طریق فایل teams.txt یا متغیر محیطی TARGET_TEAMS مدیریت می‌شوند.</i>"
+        "💡 <b>ثبت دائمی تیم‌ها:</b>\n"
+        "▫️ فایل <code>teams.txt</code> را در گیت‌هاب ویرایش کنید.\n"
+        "▫️ یا متغیر <code>TARGET_TEAMS</code> را در ریل‌وی تنظیم نمایید."
     )
 
 
 def get_channels_text():
     channels = load_channels()
     if not channels:
-        return "📢 هیچ کانالی فعال نیست."
+        return (
+            "📢 <b>هیچ کانالی متصل نیست!</b>\n\n"
+            "💡 برای ثبت دائمی کانال، متغیر <code>TELEGRAM_CHANNEL_ID</code> را در ریل‌وی ست کنید."
+        )
     ch_lines = []
     for i, ch in enumerate(channels):
         fmt = ch.get("format", "full")
-        fmt_fa = "خیلی کوتاه (short)" if fmt == "short" else ("کامل با لینک (full)" if fmt == "full" else fmt)
+        fmt_fa = "خیلی کوتاه فقط نام تیم‌ها (short)" if fmt == "short" else ("کامل با لینک (full)" if fmt == "full" else fmt)
         sig = ch.get("signature") or "ندارد"
         ch_lines.append(f"{i+1}. <b>{ch.get('name', 'کانال')}</b> (<code>{ch.get('id')}</code>)\n   ▫️ فرمت: <code>{fmt_fa}</code> | امضا: <code>{sig}</code>")
     return (
         f"📢 <b>کانال‌های فعال ({len(channels)} کانال):</b>\n\n"
         + "\n\n".join(ch_lines)
-        + "\n\n💡 <i>کانال‌ها از طریق فایل channels.json یا متغیر محیطی CHANNELS_JSON مدیریت می‌شوند.</i>"
+        + "\n\n💡 <b>ثبت دائمی کانال‌ها:</b>\n"
+        + "برای اینکه کانال‌ها با آپدیت حذف نشوند، آن‌ها را در متغیرهای <code>TELEGRAM_CHANNEL_ID</code> و <code>CHANNEL_2_ID</code> در ریل‌وی وارد کنید."
     )
 
 
@@ -861,10 +928,8 @@ def setup_bot_commands():
         return
     api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands"
     commands = [
-        {"command": "panel", "description": "🎛 پنل کنترل و دکمه‌های زمان‌بندی"},
-        {"command": "check", "description": "🚀 بررسی فوری مسابقات ورزش ۳"},
-        {"command": "teams", "description": "📋 مشاهده تیم‌های تحت نظارت"},
-        {"command": "channels", "description": "📢 مشاهده کانال‌های متصل"}
+        {"command": "panel", "description": "🎛 پنل مدیریت و تنظیمات"},
+        {"command": "check", "description": "🚀 بررسی فوری مسابقات ورزش ۳"}
     ]
     try:
         requests.post(api_url, json={"commands": commands}, timeout=10)
@@ -1012,48 +1077,57 @@ def process_telegram_admin_commands():
                     answer_callback_query(cb_id, text="⛔️ دسترسی غیرمجاز!", show_alert=True)
                     continue
 
-                if cb_data.startswith("interval:"):
+                if cb_data == "menu:interval":
+                    answer_callback_query(cb_id)
+                    if cb_msg_id:
+                        edit_telegram_admin_message(
+                            cb_chat_id, cb_msg_id,
+                            get_interval_submenu_text(),
+                            reply_markup=build_interval_submenu_keyboard(CHECK_INTERVAL)
+                        )
+
+                elif cb_data.startswith("set_interval:"):
                     interval_val = cb_data.split(":")[1]
                     success, msg = update_workflow_interval(interval_val)
                     answer_callback_query(cb_id, text=f"✅ زمان بررسی روی {get_interval_display(CHECK_INTERVAL)} تنظیم شد.")
                     if cb_msg_id:
                         edit_telegram_admin_message(
                             cb_chat_id, cb_msg_id,
-                            get_dashboard_text(),
-                            reply_markup=build_panel_inline_keyboard(CHECK_INTERVAL)
+                            get_interval_submenu_text(),
+                            reply_markup=build_interval_submenu_keyboard(CHECK_INTERVAL)
                         )
 
-                elif cb_data == "act:check":
+                elif cb_data == "menu:check":
                     answer_callback_query(cb_id, text="🚀 بررسی مسابقات ورزش ۳ آغاز شد...")
                     send_telegram_admin_message(cb_chat_id, "🔄 در حال بررسی لحظه‌ای سایت ورزش ۳...")
                     process_varzesh3()
                     send_telegram_admin_message(cb_chat_id, "✅ بررسی ورزش ۳ به پایان رسید.", reply_markup=MAIN_REPLY_KEYBOARD)
 
-                elif cb_data == "act:teams":
+                elif cb_data == "menu:teams":
                     answer_callback_query(cb_id)
                     if cb_msg_id:
                         edit_telegram_admin_message(
                             cb_chat_id, cb_msg_id,
                             get_teams_text(),
-                            reply_markup=build_back_inline_keyboard()
+                            reply_markup=build_back_keyboard()
                         )
 
-                elif cb_data == "act:channels":
+                elif cb_data == "menu:channels":
                     answer_callback_query(cb_id)
                     if cb_msg_id:
                         edit_telegram_admin_message(
                             cb_chat_id, cb_msg_id,
                             get_channels_text(),
-                            reply_markup=build_back_inline_keyboard()
+                            reply_markup=build_back_keyboard()
                         )
 
-                elif cb_data in ["act:home", "act:refresh"]:
-                    answer_callback_query(cb_id, text="🔄 پنل کنترل بروزرسانی شد.")
+                elif cb_data == "menu:home":
+                    answer_callback_query(cb_id)
                     if cb_msg_id:
                         edit_telegram_admin_message(
                             cb_chat_id, cb_msg_id,
                             get_dashboard_text(),
-                            reply_markup=build_panel_inline_keyboard(CHECK_INTERVAL)
+                            reply_markup=build_main_dashboard_keyboard()
                         )
 
                 continue
@@ -1074,13 +1148,16 @@ def process_telegram_admin_commands():
                 current_admin_id = from_id
                 send_telegram_admin_message(
                     chat_id,
-                    f"✅ شما به عنوان ادمین ثبت شدید!\n\nاکنون می‌توانید از پنل زیر ربات را مدیریت کنید.",
+                    f"✅ <b>شما به عنوان ادمین موقت ثبت شدید!</b>\n\n"
+                    f"📌 <b>برای ثبت دائمی و جلوگیری از ریست شدن با آپدیت‌ها:</b>\n"
+                    f"در تب <b>Variables</b> در Railway، متغیر زیر را اضافه کنید تا با هیچ آپدیتی ریست نشود:\n"
+                    f"<code>ADMIN_CHAT_ID</code> = <code>{from_id}</code>",
                     reply_markup=MAIN_REPLY_KEYBOARD
                 )
                 send_telegram_admin_message(
                     chat_id,
                     get_dashboard_text(),
-                    reply_markup=build_panel_inline_keyboard(CHECK_INTERVAL)
+                    reply_markup=build_main_dashboard_keyboard()
                 )
                 continue
 
@@ -1099,11 +1176,10 @@ def process_telegram_admin_commands():
             cmd = text.split()[0].lower() if text else ""
 
             if cmd in ["/start", "/panel", "/admin", "/help"] or text in ["🎛 پنل مدیریت", "🎛 پنل کنترل"]:
-                send_telegram_admin_message(chat_id, "⚽️ خوش آمدید! پنل مدیریت آماده است.", reply_markup=MAIN_REPLY_KEYBOARD)
                 send_telegram_admin_message(
                     chat_id,
                     get_dashboard_text(),
-                    reply_markup=build_panel_inline_keyboard(CHECK_INTERVAL)
+                    reply_markup=build_main_dashboard_keyboard()
                 )
 
             elif cmd == "/check" or text == "🚀 بررسی فوری":
@@ -1111,17 +1187,11 @@ def process_telegram_admin_commands():
                 process_varzesh3()
                 send_telegram_admin_message(chat_id, "✅ بررسی ورزش ۳ به پایان رسید.", reply_markup=MAIN_REPLY_KEYBOARD)
 
-            elif cmd == "/teams" or text == "📋 تیم‌های تحت مانیتور":
-                send_telegram_admin_message(chat_id, get_teams_text(), reply_markup=build_back_inline_keyboard())
-
-            elif cmd == "/channels" or text == "📢 کانال‌های متصل":
-                send_telegram_admin_message(chat_id, get_channels_text(), reply_markup=build_back_inline_keyboard())
-
             else:
                 send_telegram_admin_message(
                     chat_id,
                     get_dashboard_text(),
-                    reply_markup=build_panel_inline_keyboard(CHECK_INTERVAL)
+                    reply_markup=build_main_dashboard_keyboard()
                 )
 
         config["last_update_id"] = last_update_id
