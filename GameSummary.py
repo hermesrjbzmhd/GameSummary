@@ -5,6 +5,7 @@ import time
 import threading
 import subprocess
 import unicodedata
+import html
 import requests
 from bs4 import BeautifulSoup
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -155,6 +156,65 @@ def save_channels(channels):
     """Saves channels configuration to channels.json."""
     with open(CHANNELS_FILE, "w", encoding="utf-8") as f:
         json.dump(channels, f, ensure_ascii=False, indent=2)
+
+
+def find_channel(channels, channel_id):
+    """Returns a channel config by Telegram ID."""
+    return next(
+        (ch for ch in channels if str(ch.get("id")) == str(channel_id)),
+        None
+    )
+
+
+def get_caption_options(channel_cfg):
+    """Returns normalized per-channel caption options with legacy format support."""
+    fmt = str(channel_cfg.get("format", "full")).lower()
+    defaults_by_format = {
+        "short": {
+            "show_score": False,
+            "show_quality": False,
+            "show_download_links": False,
+            "show_source_link": False,
+        },
+        "no_links": {
+            "show_score": True,
+            "show_quality": True,
+            "show_download_links": False,
+            "show_source_link": True,
+        },
+        "full": {
+            "show_score": True,
+            "show_quality": True,
+            "show_download_links": True,
+            "show_source_link": True,
+        },
+    }
+    options = defaults_by_format.get(fmt, defaults_by_format["full"]).copy()
+    saved_options = channel_cfg.get("caption_options")
+    if isinstance(saved_options, dict):
+        for key in options:
+            if key in saved_options:
+                options[key] = bool(saved_options[key])
+    return options
+
+
+def set_channel_caption_preset(channel_cfg, preset):
+    """Applies a named caption preset and clears granular overrides."""
+    channel_cfg["format"] = preset
+    channel_cfg.pop("caption_options", None)
+
+
+def caption_style_label(channel_cfg):
+    """Human-readable caption style for the admin panel."""
+    if isinstance(channel_cfg.get("caption_options"), dict):
+        return "شخصی‌سازی‌شده"
+    labels = {
+        "short": "خلاصه",
+        "full": "کامل",
+        "no_links": "بدون لینک دانلود",
+        "custom": "قالب سفارشی",
+    }
+    return labels.get(str(channel_cfg.get("format", "full")).lower(), "کامل")
 
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -430,7 +490,11 @@ def format_channel_caption(title, qualities_dict, page_url, quality_label="", ch
         channel_cfg = {"format": "full"}
 
     fmt = channel_cfg.get("format", "full").lower()
-    signature = channel_cfg.get("signature", "").strip()
+    if "footer" in channel_cfg:
+        signature = html.escape(str(channel_cfg.get("footer", "")).strip())
+    else:
+        # Keep legacy signatures compatible with the Telegram HTML they may contain.
+        signature = str(channel_cfg.get("signature", "")).strip()
     custom_template = channel_cfg.get("custom_template")
 
     if fmt == "custom" and custom_template:
@@ -443,25 +507,16 @@ def format_channel_caption(title, qualities_dict, page_url, quality_label="", ch
                                .replace("{signature}", signature) \
                                .replace("{page_url}", page_url).strip()
 
-    if fmt == "short":
-        # Ultra-short format: only state who played against whom!
-        matchup_text = extract_teams_matchup(title)
-        lines = [matchup_text]
-        if signature:
-            lines.append("")
-            lines.append(signature)
-        return "\n".join(lines).strip()
-
-    header_text = format_spoiler_title(title)
+    options = get_caption_options(channel_cfg)
+    header_text = format_spoiler_title(title) if options["show_score"] else extract_teams_matchup(title)
     lines = [header_text]
 
-    if quality_label:
+    if options["show_quality"] and quality_label:
         display_q = quality_label.replace("Compressed HD", "HD بهینه‌شده")
         lines.append(f"🎬 کیفیت پخش: <b>{display_q}</b>")
 
-    lines.append("")  # spacing
-
-    if fmt == "full" and qualities_dict:
+    if options["show_download_links"] and qualities_dict:
+        lines.append("")
         lines.append("📥 <b>لینک‌های دانلود مستقیم:</b>")
         for label, url in qualities_dict.items():
             clean_label = (
@@ -470,9 +525,9 @@ def format_channel_caption(title, qualities_dict, page_url, quality_label="", ch
                      .replace("FHD", "Full HD")
             )
             lines.append(f"▫️ <a href='{url}'>{clean_label}</a>")
+    if options["show_source_link"] and page_url:
         lines.append("")
-
-    lines.append(f"🔗 <a href='{page_url}'>مشاهده در سایت ورزش سه</a>")
+        lines.append(f"🔗 <a href='{page_url}'>مشاهده در سایت ورزش سه</a>")
 
     if signature:
         lines.append("")
@@ -830,9 +885,10 @@ def process_varzesh3():
 
 MAIN_REPLY_KEYBOARD = {
     "keyboard": [
-        [{"text": "🎛 پنل مدیریت"}, {"text": "🚀 بررسی فوری"}]
+        [{"text": "🎛 پنل مدیریت"}, {"text": "🔄 بررسی الان"}]
     ],
-    "resize_keyboard": True
+    "resize_keyboard": True,
+    "is_persistent": True
 }
 
 
@@ -870,12 +926,12 @@ def build_main_dashboard_keyboard():
     """Clean, categorized main panel."""
     return {
         "inline_keyboard": [
-            [{"text": "⏱ تنظیم زمان‌بندی بررسی", "callback_data": "menu:interval"}],
-            [{"text": "🚀 بررسی فوری مسابقات ورزش ۳", "callback_data": "menu:check"}],
+            [{"text": "🔄 بررسی فوری مسابقات", "callback_data": "menu:check"}],
             [
-                {"text": "📋 مدیریت تیم‌ها", "callback_data": "menu:teams"},
-                {"text": "📢 مدیریت کانال‌ها", "callback_data": "menu:channels"}
-            ]
+                {"text": "⚽ تیم‌ها", "callback_data": "menu:teams"},
+                {"text": "📺 کانال‌ها", "callback_data": "menu:channels"}
+            ],
+            [{"text": "⏱ زمان‌بندی بررسی", "callback_data": "menu:interval"}]
         ]
     }
 
@@ -940,12 +996,12 @@ def build_teams_delete_keyboard():
 def build_channels_keyboard():
     return {
         "inline_keyboard": [
-            [{"text": "➕ افزودن کانال جدید", "callback_data": "chan:add"}],
+            [{"text": "➕ افزودن کانال", "callback_data": "chan:add"}],
+            [{"text": "🎨 تنظیم ظاهر پیام‌ها", "callback_data": "chan:settings"}],
             [
-                {"text": "✏️ تغییر فرمت کپشن", "callback_data": "chan:fmt_menu"},
-                {"text": "🗑 حذف کانال", "callback_data": "chan:del_menu"}
-            ],
-            [{"text": "🔙 بازگشت به پنل اصلی", "callback_data": "menu:home"}]
+                {"text": "🗑 حذف کانال", "callback_data": "chan:del_menu"},
+                {"text": "🏠 پنل اصلی", "callback_data": "menu:home"}
+            ]
         ]
     }
 
@@ -953,11 +1009,11 @@ def build_channels_keyboard():
 def build_channels_select_for_format_keyboard():
     channels = load_channels()
     keyboard = []
-    for ch in channels:
+    for index, ch in enumerate(channels):
         cid = str(ch.get("id"))
         cname = ch.get("name") or cid
-        cfmt = ch.get("format", "full")
-        keyboard.append([{"text": f"📢 {cname} ({cfmt})", "callback_data": f"chan_choose_fmt:{cid}"}])
+        style = caption_style_label(ch)
+        keyboard.append([{"text": f"📺 {cname} · {style}", "callback_data": f"chan_cfg:{index}"}])
     keyboard.append([{"text": "🔙 بازگشت به مدیریت کانال‌ها", "callback_data": "menu:channels"}])
     return {"inline_keyboard": keyboard}
 
@@ -971,6 +1027,55 @@ def build_channels_format_pick_keyboard(cid):
             [{"text": "🔙 بازگشت به لیست کانال‌ها", "callback_data": "menu:channels"}]
         ]
     }
+
+
+def build_channel_settings_keyboard(channel_index, channel_cfg):
+    options = get_caption_options(channel_cfg)
+
+    def toggle_label(key, label):
+        return f"{'✅' if options[key] else '▫️'} {label}"
+
+    footer = channel_cfg.get("footer", channel_cfg.get("signature", "")).strip()
+    footer_row = [
+        {"text": "✍️ متن دلخواه پایین پیام", "callback_data": f"chan_footer:{channel_index}"}
+    ]
+    if footer:
+        footer_row.append({"text": "🧹 پاک‌کردن", "callback_data": f"chan_footer_clear:{channel_index}"})
+
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "ساده", "callback_data": f"chan_preset:{channel_index}:short"},
+                {"text": "بدون دانلود", "callback_data": f"chan_preset:{channel_index}:no_links"},
+                {"text": "کامل", "callback_data": f"chan_preset:{channel_index}:full"},
+            ],
+            [
+                {"text": toggle_label("show_score", "نتیجه"), "callback_data": f"chan_toggle:{channel_index}:score"},
+                {"text": toggle_label("show_quality", "کیفیت"), "callback_data": f"chan_toggle:{channel_index}:quality"},
+            ],
+            [
+                {"text": toggle_label("show_download_links", "لینک دانلود"), "callback_data": f"chan_toggle:{channel_index}:downloads"},
+                {"text": toggle_label("show_source_link", "لینک منبع"), "callback_data": f"chan_toggle:{channel_index}:source"},
+            ],
+            footer_row,
+            [{"text": "👁 پیش‌نمایش پیام", "callback_data": f"chan_preview:{channel_index}"}],
+            [{"text": "🔙 فهرست کانال‌ها", "callback_data": "chan:settings"}],
+        ]
+    }
+
+
+def get_channel_settings_text(channel_index, channel_cfg):
+    options = get_caption_options(channel_cfg)
+    footer = channel_cfg.get("footer", channel_cfg.get("signature", "")).strip()
+    footer_status = html.escape(footer) if footer else "تنظیم نشده"
+    enabled_count = sum(bool(value) for value in options.values())
+    return (
+        f"🎨 <b>ظاهر پیام کانال {html.escape(str(channel_cfg.get('name') or channel_cfg.get('id')))}</b>\n\n"
+        f"سبک فعلی: <b>{caption_style_label(channel_cfg)}</b>\n"
+        f"اجزای فعال: <code>{enabled_count} از ۴</code>\n"
+        f"متن پایین پیام: <code>{footer_status}</code>\n\n"
+        "هر بخش را جداگانه روشن یا خاموش کنید؛ یا یکی از سه قالب آماده را بزنید."
+    )
 
 
 def build_channels_delete_keyboard():
@@ -1034,14 +1139,17 @@ def get_channels_text():
         )
     ch_lines = []
     for i, ch in enumerate(channels):
-        fmt = ch.get("format", "full")
-        fmt_fa = "خیلی کوتاه فقط نام تیم‌ها (short)" if fmt == "short" else ("کامل با لینک (full)" if fmt == "full" else ("بدون لینک (no_links)" if fmt == "no_links" else fmt))
-        sig = ch.get("signature") or "ندارد"
-        ch_lines.append(f"{i+1}. <b>{ch.get('name', 'کانال')}</b> (<code>{ch.get('id')}</code>)\n   ▫️ فرمت: <code>{fmt_fa}</code> | امضا: <code>{sig}</code>")
+        footer = ch.get("footer", ch.get("signature", "")).strip()
+        footer_status = "دارد" if footer else "ندارد"
+        ch_lines.append(
+            f"{i+1}. <b>{html.escape(str(ch.get('name', 'کانال')))}</b> "
+            f"(<code>{html.escape(str(ch.get('id')))}</code>)\n"
+            f"   🎨 {caption_style_label(ch)} · ✍️ متن دلخواه: {footer_status}"
+        )
     return (
         f"📢 <b>مدیریت کانال‌های فعال ({len(channels)} کانال):</b>\n\n"
         + "\n\n".join(ch_lines)
-        + "\n\n👇 <i>از دکمه‌های زیر برای افزودن، حذف یا تغییر فرمت کانال‌ها استفاده کنید:</i>"
+        + "\n\nاز بخش «تنظیم ظاهر پیام‌ها» می‌توانید محتوای هر کانال را جداگانه بچینید."
     )
 
 
@@ -1333,14 +1441,156 @@ def process_telegram_admin_commands():
                                 reply_markup=build_back_keyboard("menu:channels")
                             )
 
-                elif cb_data == "chan:fmt_menu":
+                elif cb_data in ["chan:settings", "chan:fmt_menu"]:
+                    answer_callback_query(cb_id)
+                    ADMIN_STATE.pop(cb_chat_id, None)
+                    if cb_msg_id:
+                        edit_telegram_admin_message(
+                            cb_chat_id, cb_msg_id,
+                            "🎨 <b>تنظیم ظاهر پیام‌ها</b>\n\n"
+                            "برای هر کانال می‌توانید نتیجه، کیفیت، لینک‌ها و متن پایین پیام را جداگانه تنظیم کنید.\n\n"
+                            "یک کانال را انتخاب کنید:",
+                            reply_markup=build_channels_select_for_format_keyboard()
+                        )
+
+                elif cb_data.startswith("chan_cfg:"):
+                    try:
+                        channel_index = int(cb_data.split(":")[1])
+                        channels = load_channels()
+                        channel_cfg = channels[channel_index]
+                    except (ValueError, IndexError):
+                        answer_callback_query(cb_id, text="این کانال دیگر وجود ندارد.", show_alert=True)
+                        continue
+
+                    ADMIN_STATE.pop(cb_chat_id, None)
                     answer_callback_query(cb_id)
                     if cb_msg_id:
                         edit_telegram_admin_message(
                             cb_chat_id, cb_msg_id,
-                            "✏️ <b>تغییر فرمت کپشن کانال:</b>\n\nکانال مورد نظر را انتخاب کنید:",
-                            reply_markup=build_channels_select_for_format_keyboard()
+                            get_channel_settings_text(channel_index, channel_cfg),
+                            reply_markup=build_channel_settings_keyboard(channel_index, channel_cfg)
                         )
+
+                elif cb_data.startswith("chan_preset:"):
+                    try:
+                        _, index_text, preset = cb_data.split(":", 2)
+                        channel_index = int(index_text)
+                        if preset not in ["short", "no_links", "full"]:
+                            raise ValueError("invalid preset")
+                        channels = load_channels()
+                        channel_cfg = channels[channel_index]
+                        set_channel_caption_preset(channel_cfg, preset)
+                        save_channels(channels)
+                    except (ValueError, IndexError):
+                        answer_callback_query(cb_id, text="تنظیمات نامعتبر است.", show_alert=True)
+                        continue
+
+                    answer_callback_query(cb_id, text="✅ قالب پیام تغییر کرد.")
+                    if cb_msg_id:
+                        edit_telegram_admin_message(
+                            cb_chat_id, cb_msg_id,
+                            get_channel_settings_text(channel_index, channel_cfg),
+                            reply_markup=build_channel_settings_keyboard(channel_index, channel_cfg)
+                        )
+
+                elif cb_data.startswith("chan_toggle:"):
+                    option_keys = {
+                        "score": "show_score",
+                        "quality": "show_quality",
+                        "downloads": "show_download_links",
+                        "source": "show_source_link",
+                    }
+                    try:
+                        _, index_text, option_name = cb_data.split(":", 2)
+                        channel_index = int(index_text)
+                        option_key = option_keys[option_name]
+                        channels = load_channels()
+                        channel_cfg = channels[channel_index]
+                        options = get_caption_options(channel_cfg)
+                        options[option_key] = not options[option_key]
+                        channel_cfg["caption_options"] = options
+                        save_channels(channels)
+                    except (ValueError, IndexError, KeyError):
+                        answer_callback_query(cb_id, text="تنظیمات نامعتبر است.", show_alert=True)
+                        continue
+
+                    answer_callback_query(cb_id, text="✅ تنظیم ذخیره شد.")
+                    if cb_msg_id:
+                        edit_telegram_admin_message(
+                            cb_chat_id, cb_msg_id,
+                            get_channel_settings_text(channel_index, channel_cfg),
+                            reply_markup=build_channel_settings_keyboard(channel_index, channel_cfg)
+                        )
+
+                elif cb_data.startswith("chan_footer:"):
+                    try:
+                        channel_index = int(cb_data.split(":")[1])
+                        channels = load_channels()
+                        channel_cfg = channels[channel_index]
+                    except (ValueError, IndexError):
+                        answer_callback_query(cb_id, text="این کانال دیگر وجود ندارد.", show_alert=True)
+                        continue
+
+                    ADMIN_STATE[cb_chat_id] = {
+                        "action": "wait_channel_footer",
+                        "channel_id": str(channel_cfg.get("id")),
+                    }
+                    answer_callback_query(cb_id)
+                    if cb_msg_id:
+                        edit_telegram_admin_message(
+                            cb_chat_id, cb_msg_id,
+                            "✍️ <b>متن دلخواه پایین پیام</b>\n\n"
+                            "متنی را که باید انتهای پیام‌های این کانال نمایش داده شود بفرستید. "
+                            "می‌توانید چند خط، ایموجی، آیدی کانال یا هشتگ بنویسید.\n\n"
+                            "حداکثر: <code>۵۰۰ نویسه</code>",
+                            reply_markup=build_back_keyboard(f"chan_cfg:{channel_index}")
+                        )
+
+                elif cb_data.startswith("chan_footer_clear:"):
+                    try:
+                        channel_index = int(cb_data.split(":")[1])
+                        channels = load_channels()
+                        channel_cfg = channels[channel_index]
+                        channel_cfg["footer"] = ""
+                        channel_cfg["signature"] = ""
+                        save_channels(channels)
+                    except (ValueError, IndexError):
+                        answer_callback_query(cb_id, text="این کانال دیگر وجود ندارد.", show_alert=True)
+                        continue
+
+                    answer_callback_query(cb_id, text="🧹 متن پایین پیام پاک شد.")
+                    if cb_msg_id:
+                        edit_telegram_admin_message(
+                            cb_chat_id, cb_msg_id,
+                            get_channel_settings_text(channel_index, channel_cfg),
+                            reply_markup=build_channel_settings_keyboard(channel_index, channel_cfg)
+                        )
+
+                elif cb_data.startswith("chan_preview:"):
+                    try:
+                        channel_index = int(cb_data.split(":")[1])
+                        channels = load_channels()
+                        channel_cfg = channels[channel_index]
+                    except (ValueError, IndexError):
+                        answer_callback_query(cb_id, text="این کانال دیگر وجود ندارد.", show_alert=True)
+                        continue
+
+                    preview = format_channel_caption(
+                        "خلاصه بازی استقلال ۲ - ۱ پرسپولیس",
+                        {
+                            "720p": "https://example.com/video-720.mp4",
+                            "480p": "https://example.com/video-480.mp4",
+                        },
+                        "https://video.varzesh3.com/sample",
+                        "720p",
+                        channel_cfg,
+                    )
+                    answer_callback_query(cb_id, text="پیش‌نمایش ساخته شد.")
+                    send_telegram_admin_message(
+                        cb_chat_id,
+                        f"👁 <b>پیش‌نمایش پیام</b>\n\n{preview}",
+                        reply_markup=build_back_keyboard(f"chan_cfg:{channel_index}")
+                    )
 
                 elif cb_data.startswith("chan_choose_fmt:"):
                     cid = cb_data.split(":")[1]
@@ -1437,6 +1687,47 @@ def process_telegram_admin_commands():
             user_state = ADMIN_STATE.get(chat_id, {})
             current_action = user_state.get("action")
 
+            if current_action == "wait_channel_footer":
+                if not text:
+                    send_telegram_admin_message(
+                        chat_id,
+                        "لطفاً متن پایین پیام را به‌صورت یک پیام متنی بفرستید.",
+                        reply_markup=build_back_keyboard("chan:settings")
+                    )
+                    continue
+
+                if len(text) > 500:
+                    send_telegram_admin_message(
+                        chat_id,
+                        f"⚠️ متن شما {len(text)} نویسه است. لطفاً آن را به حداکثر ۵۰۰ نویسه کوتاه کنید.",
+                        reply_markup=build_back_keyboard("chan:settings")
+                    )
+                    continue
+
+                channels = load_channels()
+                channel_cfg = find_channel(channels, user_state.get("channel_id"))
+                if channel_cfg is None:
+                    ADMIN_STATE.pop(chat_id, None)
+                    send_telegram_admin_message(
+                        chat_id,
+                        "⚠️ کانال مورد نظر پیدا نشد؛ شاید حذف شده باشد.",
+                        reply_markup=build_channels_keyboard()
+                    )
+                    continue
+
+                channel_cfg["footer"] = text
+                channel_cfg["signature"] = ""
+                save_channels(channels)
+                ADMIN_STATE.pop(chat_id, None)
+                channel_index = channels.index(channel_cfg)
+                send_telegram_admin_message(
+                    chat_id,
+                    "✅ متن دلخواه ذخیره شد و از این به بعد پایین پیام‌های این کانال می‌آید.\n\n"
+                    + get_channel_settings_text(channel_index, channel_cfg),
+                    reply_markup=build_channel_settings_keyboard(channel_index, channel_cfg)
+                )
+                continue
+
             if current_action == "wait_team_name" and text:
                 team_name = text.strip()
                 teams = load_target_teams()
@@ -1514,7 +1805,7 @@ def process_telegram_admin_commands():
                     reply_markup=build_main_dashboard_keyboard()
                 )
 
-            elif cmd == "/check" or text == "🚀 بررسی فوری":
+            elif cmd == "/check" or text in ["🚀 بررسی فوری", "🔄 بررسی الان"]:
                 send_telegram_admin_message(chat_id, "🔄 در حال بررسی لحظه‌ای سایت ورزش ۳...")
                 process_varzesh3()
                 send_telegram_admin_message(chat_id, "✅ بررسی ورزش ۳ به پایان رسید.", reply_markup=MAIN_REPLY_KEYBOARD)
