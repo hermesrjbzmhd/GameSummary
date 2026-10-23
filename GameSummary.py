@@ -78,6 +78,32 @@ def save_config(cfg):
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 
+def get_disabled_channel_ids():
+    """Returns channel IDs intentionally removed through the admin panel."""
+    cfg = load_config()
+    values = cfg.get("disabled_channel_ids", [])
+    if not isinstance(values, list):
+        return set()
+    return {str(value).strip() for value in values if str(value).strip()}
+
+
+def set_channel_disabled(channel_id, disabled=True):
+    """Persists channel deletion even when the ID is supplied by environment."""
+    channel_id = str(channel_id).strip()
+    cfg = load_config()
+    disabled_ids = {
+        str(value).strip()
+        for value in cfg.get("disabled_channel_ids", [])
+        if str(value).strip()
+    }
+    if disabled:
+        disabled_ids.add(channel_id)
+    else:
+        disabled_ids.discard(channel_id)
+    cfg["disabled_channel_ids"] = sorted(disabled_ids)
+    save_config(cfg)
+
+
 def get_admin_id():
     """Returns admin Telegram ID from environment or config.json."""
     env_admin = (
@@ -96,6 +122,7 @@ def load_channels():
     """Loads configured channels from channels.json or environment variables."""
     channels = []
     existing_ids = set()
+    disabled_ids = get_disabled_channel_ids()
 
     # 1. From channels.json file
     if os.path.exists(CHANNELS_FILE):
@@ -105,7 +132,7 @@ def load_channels():
                 if isinstance(loaded, list):
                     for ch in loaded:
                         cid = str(ch.get("id", "")).strip()
-                        if cid and "-100xxxxxxxxxx" not in cid and cid not in existing_ids:
+                        if cid and "-100xxxxxxxxxx" not in cid and cid not in existing_ids and cid not in disabled_ids:
                             channels.append(ch)
                             existing_ids.add(cid)
         except Exception as e:
@@ -113,7 +140,7 @@ def load_channels():
 
     # 2. Main Channel (Channel 1) from environment
     ch1_id = os.getenv("CHANNEL_ID") or os.getenv("TELEGRAM_CHANNEL_ID") or CHANNEL_ID
-    if ch1_id and str(ch1_id).strip() not in existing_ids and "-100xxxxxxxxxx" not in str(ch1_id):
+    if ch1_id and str(ch1_id).strip() not in existing_ids and str(ch1_id).strip() not in disabled_ids and "-100xxxxxxxxxx" not in str(ch1_id):
         channels.insert(0, {
             "id": str(ch1_id).strip(),
             "name": "کانال اصلی",
@@ -124,7 +151,7 @@ def load_channels():
 
     # 3. Channel 2 from environment (default short format)
     ch2_id = os.getenv("CHANNEL_2_ID") or os.getenv("TELEGRAM_CHANNEL_2_ID") or CHANNEL_2_ID
-    if ch2_id and str(ch2_id).strip() not in existing_ids:
+    if ch2_id and str(ch2_id).strip() not in existing_ids and str(ch2_id).strip() not in disabled_ids:
         ch2_sig = os.getenv("CHANNEL_2_SIGNATURE", CHANNEL_2_SIGNATURE)
         ch2_fmt = os.getenv("CHANNEL_2_FORMAT", CHANNEL_2_FORMAT)
         channels.append({
@@ -143,7 +170,7 @@ def load_channels():
             if isinstance(parsed, list):
                 for ch in parsed:
                     cid = str(ch.get("id", "")).strip()
-                    if cid and cid not in existing_ids:
+                    if cid and cid not in existing_ids and cid not in disabled_ids:
                         channels.append(ch)
                         existing_ids.add(cid)
         except Exception as e:
@@ -329,6 +356,21 @@ def save_target_teams(teams):
                 f.write(f"{t_clean}\n")
 
 
+def validate_team_name(team_name):
+    """Validates a single team name entered in the admin panel."""
+    raw_name = str(team_name or "")
+    if any(separator in raw_name for separator in ["\n", ",", "،", ";", "؛", "|"]):
+        return False, "هر بار فقط نام یک تیم را بفرستید."
+    cleaned = " ".join(raw_name.split())
+    if len(cleaned) < 2:
+        return False, "نام تیم باید حداقل ۲ نویسه داشته باشد."
+    if len(cleaned) > 60:
+        return False, "نام تیم باید حداکثر ۶۰ نویسه داشته باشد."
+    if not any(char.isalpha() for char in cleaned):
+        return False, "نام تیم باید شامل حروف باشد."
+    return True, cleaned
+
+
 def load_sent_videos():
     """Loads history of sent videos."""
     if os.path.exists(HISTORY_FILE):
@@ -346,15 +388,60 @@ def save_sent_videos(sent_list):
         json.dump(list(sent_list), f, ensure_ascii=False, indent=2)
 
 
-def is_matching_team(title, allowed_teams):
-    """Checks if title is a highlight and contains an allowed team name."""
-    normalized_title = normalize_text(title)
+def extract_football_match_teams(title):
+    """Extracts both team names from a football highlight title.
 
-    if not any(kw in normalized_title for kw in ["خلاصه", "kholase", "highlights"]):
+    A deliberately strict ``خلاصه بازی`` prefix and a score separator are
+    required. This keeps basketball/volleyball highlights and general videos
+    out of the football bot before team matching even starts.
+    """
+    normalized_title = normalize_text(title)
+    prefix_match = re.match(r"^خلاصه\s+بازی\s+(.+)$", normalized_title)
+    if not prefix_match:
+        return None
+
+    match_text = prefix_match.group(1).strip()
+    non_football_sports = (
+        "بسکتبال", "والیبال", "هندبال", "فوتسال", "کشتی",
+        "تنیس", "هاکی", "بیسبال", "راگبی", "گلبال",
+    )
+    if any(sport in match_text for sport in non_football_sports):
+        return None
+
+    # Team A 2 - Team B 1
+    score_at_both_ends = re.match(
+        r"^(.+?)\s+(\d+)\s*[-–—]\s*(.+?)\s+(\d+)$",
+        match_text,
+    )
+    if score_at_both_ends:
+        return (
+            normalize_text(score_at_both_ends.group(1)),
+            normalize_text(score_at_both_ends.group(3)),
+        )
+
+    # Team A 2 - 1 Team B
+    score_in_middle = re.match(
+        r"^(.+?)\s+(\d+)\s*[-–—]\s*(\d+)\s+(.+)$",
+        match_text,
+    )
+    if score_in_middle:
+        return (
+            normalize_text(score_in_middle.group(1)),
+            normalize_text(score_in_middle.group(4)),
+        )
+
+    return None
+
+
+def is_matching_team(title, allowed_teams):
+    """Matches a monitored team against either complete football team name."""
+    match_teams = extract_football_match_teams(title)
+    if not match_teams:
         return False, None
 
     for team in allowed_teams:
-        if team in normalized_title:
+        normalized_team = normalize_text(team)
+        if normalized_team and normalized_team in match_teams:
             return True, team
 
     return False, None
@@ -967,14 +1054,13 @@ def build_back_keyboard(back_callback="menu:home"):
 
 
 def build_teams_keyboard():
+    teams = load_target_teams()
+    keyboard = [[{"text": "➕ افزودن تیم", "callback_data": "teams:add"}]]
+    if teams:
+        keyboard.append([{"text": "🗑 انتخاب تیم برای حذف", "callback_data": "teams:del_menu"}])
+    keyboard.append([{"text": "🏠 پنل اصلی", "callback_data": "menu:home"}])
     return {
-        "inline_keyboard": [
-            [
-                {"text": "➕ افزودن تیم جدید", "callback_data": "teams:add"},
-                {"text": "🗑 حذف تیم", "callback_data": "teams:del_menu"}
-            ],
-            [{"text": "🔙 بازگشت به پنل اصلی", "callback_data": "menu:home"}]
-        ]
+        "inline_keyboard": keyboard
     }
 
 
@@ -983,14 +1069,23 @@ def build_teams_delete_keyboard():
     keyboard = []
     row = []
     for i, t in enumerate(teams):
-        row.append({"text": f"❌ {t}", "callback_data": f"team_del:{i}"})
+        row.append({"text": f"⚽ {t}", "callback_data": f"team_del_confirm:{i}"})
         if len(row) == 2:
             keyboard.append(row)
             row = []
     if row:
         keyboard.append(row)
-    keyboard.append([{"text": "🔙 بازگشت به مدیریت تیم‌ها", "callback_data": "menu:teams"}])
+    keyboard.append([{"text": "🔙 انصراف و بازگشت", "callback_data": "menu:teams"}])
     return {"inline_keyboard": keyboard}
+
+
+def build_team_delete_confirm_keyboard(team_index):
+    return {
+        "inline_keyboard": [
+            [{"text": "✅ بله، حذف شود", "callback_data": f"team_del_do:{team_index}"}],
+            [{"text": "↩️ نه، برگرد", "callback_data": "teams:del_menu"}],
+        ]
+    }
 
 
 def build_channels_keyboard():
@@ -1081,12 +1176,21 @@ def get_channel_settings_text(channel_index, channel_cfg):
 def build_channels_delete_keyboard():
     channels = load_channels()
     keyboard = []
-    for ch in channels:
+    for channel_index, ch in enumerate(channels):
         cid = str(ch.get("id"))
         cname = ch.get("name") or cid
-        keyboard.append([{"text": f"❌ {cname} ({cid})", "callback_data": f"chan_del:{cid}"}])
-    keyboard.append([{"text": "🔙 بازگشت به مدیریت کانال‌ها", "callback_data": "menu:channels"}])
+        keyboard.append([{"text": f"📺 {cname}", "callback_data": f"chan_del_confirm:{channel_index}"}])
+    keyboard.append([{"text": "🔙 انصراف و بازگشت", "callback_data": "menu:channels"}])
     return {"inline_keyboard": keyboard}
+
+
+def build_channel_delete_confirm_keyboard(channel_index):
+    return {
+        "inline_keyboard": [
+            [{"text": "✅ بله، کانال حذف شود", "callback_data": f"chan_del_do:{channel_index}"}],
+            [{"text": "↩️ نه، برگرد", "callback_data": "chan:del_menu"}],
+        ]
+    }
 
 
 def get_dashboard_text():
@@ -1117,15 +1221,15 @@ def get_teams_text():
     teams = load_target_teams()
     if not teams:
         return (
-            "📋 <b>مدیریت تیم‌های تحت نظارت</b>\n\n"
-            "⚠️ هیچ تیمی در لیست مانیتورینگ نیست.\n\n"
-            "برای افزودن، دکمه <b>➕ افزودن تیم جدید</b> را بزنید."
+            "⚽ <b>تیم‌های تحت نظارت</b>\n\n"
+            "هنوز تیمی اضافه نشده است.\n"
+            "برای شروع، دکمهٔ «➕ افزودن تیم» را بزنید."
         )
-    teams_list = "\n".join([f"{i+1}. {t}" for i, t in enumerate(teams)])
+    teams_list = "\n".join([f"{i+1}.  <b>{html.escape(t)}</b>" for i, t in enumerate(teams)])
     return (
-        f"📋 <b>مدیریت تیم‌های تحت نظارت ({len(teams)} تیم):</b>\n\n"
+        f"⚽ <b>تیم‌های تحت نظارت</b> · {len(teams)} تیم\n\n"
         f"{teams_list}\n\n"
-        "👇 <i>از دکمه‌های زیر برای افزودن یا حذف کلیکی تیم‌ها استفاده کنید:</i>"
+        "نام تیم‌ها به‌صورت کامل تطبیق داده می‌شود؛ مثلاً «استقلال» با «استقلال خوزستان» یکی نیست."
     )
 
 
@@ -1133,9 +1237,9 @@ def get_channels_text():
     channels = load_channels()
     if not channels:
         return (
-            "📢 <b>مدیریت کانال‌های فعال</b>\n\n"
-            "⚠️ هیچ کانالی متصل نیست!\n\n"
-            "برای اتصال، دکمه <b>➕ افزودن کانال جدید</b> را بزنید."
+            "📺 <b>کانال‌های مقصد</b>\n\n"
+            "هنوز کانالی متصل نشده است.\n"
+            "ربات را در کانال ادمین کنید و سپس «➕ افزودن کانال» را بزنید."
         )
     ch_lines = []
     for i, ch in enumerate(channels):
@@ -1147,7 +1251,7 @@ def get_channels_text():
             f"   🎨 {caption_style_label(ch)} · ✍️ متن دلخواه: {footer_status}"
         )
     return (
-        f"📢 <b>مدیریت کانال‌های فعال ({len(channels)} کانال):</b>\n\n"
+        f"📺 <b>کانال‌های مقصد</b> · {len(channels)} کانال\n\n"
         + "\n\n".join(ch_lines)
         + "\n\nاز بخش «تنظیم ظاهر پیام‌ها» می‌توانید محتوای هر کانال را جداگانه بچینید."
     )
@@ -1364,7 +1468,11 @@ def process_telegram_admin_commands():
                     if cb_msg_id:
                         edit_telegram_admin_message(
                             cb_chat_id, cb_msg_id,
-                            "➕ <b>افزودن تیم جدید:</b>\n\nلطفاً نام تیم مورد نظر را در چت تایپ و ارسال کنید:\n(مثال: <code>میلان</code> یا <code>دورتموند</code>)",
+                            "➕ <b>افزودن تیم</b>\n\n"
+                            "نام کامل تیم را در یک پیام بفرستید.\n\n"
+                            "مثال درست: <code>استقلال خوزستان</code>\n"
+                            "مثال درست: <code>آ اس رم</code>\n\n"
+                            "ربات نام را دقیق ثبت می‌کند تا تیم‌های مشابه با هم اشتباه نشوند.",
                             reply_markup=build_back_keyboard("menu:teams")
                         )
 
@@ -1373,26 +1481,43 @@ def process_telegram_admin_commands():
                     if cb_msg_id:
                         edit_telegram_admin_message(
                             cb_chat_id, cb_msg_id,
-                            "🗑 <b>حذف تیم:</b>\n\nروی نام تیمی که قصد حذف آن را دارید کلیک کنید:",
+                            "🗑 <b>حذف تیم</b>\n\nتیمی را که می‌خواهید حذف شود انتخاب کنید:",
                             reply_markup=build_teams_delete_keyboard()
                         )
 
-                elif cb_data.startswith("team_del:"):
+                elif cb_data.startswith("team_del_confirm:"):
                     try:
-                        idx = int(cb_data.split(":")[1])
+                        idx = int(cb_data.rsplit(":", 1)[1])
                         teams = load_target_teams()
                         if 0 <= idx < len(teams):
-                            del_name = teams.pop(idx)
-                            save_target_teams(teams)
-                            answer_callback_query(cb_id, text=f"❌ تیم {del_name} حذف شد.")
+                            team_name = teams[idx]
+                            answer_callback_query(cb_id)
                             if cb_msg_id:
                                 edit_telegram_admin_message(
                                     cb_chat_id, cb_msg_id,
-                                    "🗑 <b>حذف تیم:</b>\n\nروی نام تیمی که قصد حذف آن را دارید کلیک کنید:",
-                                    reply_markup=build_teams_delete_keyboard()
+                                    f"⚠️ تیم <b>{html.escape(team_name)}</b> از فهرست نظارت حذف شود؟",
+                                    reply_markup=build_team_delete_confirm_keyboard(idx)
                                 )
                     except Exception as e:
-                        print(f"[-] Error deleting team: {e}")
+                        print(f"[-] Error selecting team for deletion: {e}")
+
+                elif cb_data.startswith("team_del_do:"):
+                    try:
+                        idx = int(cb_data.rsplit(":", 1)[1])
+                        teams = load_target_teams()
+                        if not 0 <= idx < len(teams):
+                            raise IndexError("team no longer exists")
+                        deleted_name = teams.pop(idx)
+                        save_target_teams(teams)
+                        answer_callback_query(cb_id, text=f"✅ {deleted_name} حذف شد.")
+                        if cb_msg_id:
+                            edit_telegram_admin_message(
+                                cb_chat_id, cb_msg_id,
+                                get_teams_text(),
+                                reply_markup=build_teams_keyboard()
+                            )
+                    except (ValueError, IndexError):
+                        answer_callback_query(cb_id, text="این تیم دیگر در فهرست نیست.", show_alert=True)
 
                 # --- CHANNELS CRUD ---
                 elif cb_data == "menu:channels":
@@ -1411,9 +1536,10 @@ def process_telegram_admin_commands():
                     if cb_msg_id:
                         edit_telegram_admin_message(
                             cb_chat_id, cb_msg_id,
-                            "➕ <b>افزودن کانال جدید:</b>\n\n"
-                            "لطفاً یک پیام از کانال را به اینجا <b>فوروارد</b> کنید، یا آیدی عددی کانال (مثلاً <code>-1001234567890</code>) را ارسال کنید:\n\n"
-                            "⚠️ <i>دقت فرمایید ربات باید در کانال مقصد ادمین با دسترسی ارسال پیام باشد.</i>",
+                            "➕ <b>افزودن کانال</b> · مرحله ۱ از ۲\n\n"
+                            "یک پیام از کانال را به این چت فوروارد کنید. اگر فوروارد ممکن نیست، آیدی عددی کانال را بفرستید؛ مثل:\n"
+                            "<code>-1001234567890</code>\n\n"
+                            "پیش‌نیاز: ربات باید در کانال، دسترسی ارسال پیام داشته باشد.",
                             reply_markup=build_back_keyboard("menu:channels")
                         )
 
@@ -1425,20 +1551,24 @@ def process_telegram_admin_commands():
                     if cid:
                         channels = load_channels()
                         channels = [c for c in channels if str(c.get("id")) != str(cid)]
-                        channels.append({
+                        channel_cfg = {
                             "id": str(cid),
                             "name": title,
                             "format": fmt,
                             "signature": ""
-                        })
+                        }
+                        channels.append(channel_cfg)
                         save_channels(channels)
+                        set_channel_disabled(cid, False)
                         ADMIN_STATE.pop(cb_chat_id, None)
                         answer_callback_query(cb_id, text=f"✅ کانال {title} اضافه شد.")
                         if cb_msg_id:
+                            channel_index = len(channels) - 1
                             edit_telegram_admin_message(
                                 cb_chat_id, cb_msg_id,
-                                f"✅ کانال <b>{title}</b> (<code>{cid}</code>) با فرمت <b>{fmt}</b> با موفقیت اضافه شد.",
-                                reply_markup=build_back_keyboard("menu:channels")
+                                f"✅ کانال <b>{html.escape(str(title))}</b> اضافه شد.\n\n"
+                                + get_channel_settings_text(channel_index, channel_cfg),
+                                reply_markup=build_channel_settings_keyboard(channel_index, channel_cfg)
                             )
 
                 elif cb_data in ["chan:settings", "chan:fmt_menu"]:
@@ -1624,21 +1754,47 @@ def process_telegram_admin_commands():
                     if cb_msg_id:
                         edit_telegram_admin_message(
                             cb_chat_id, cb_msg_id,
-                            "🗑 <b>حذف کانال:</b>\n\nروی کانالی که قصد حذف آن را دارید کلیک کنید:",
+                            "🗑 <b>حذف کانال</b>\n\nکانال مورد نظر را انتخاب کنید. قبل از حذف از شما تأیید می‌گیرم:",
                             reply_markup=build_channels_delete_keyboard()
                         )
 
-                elif cb_data.startswith("chan_del:"):
-                    cid = cb_data.split(":")[1]
-                    channels = load_channels()
-                    channels = [c for c in channels if str(c.get("id")) != str(cid)]
-                    save_channels(channels)
-                    answer_callback_query(cb_id, text="کانال با موفقیت حذف شد.")
+                elif cb_data.startswith("chan_del_confirm:"):
+                    try:
+                        channel_index = int(cb_data.rsplit(":", 1)[1])
+                        channels = load_channels()
+                        channel_cfg = channels[channel_index]
+                    except (ValueError, IndexError):
+                        answer_callback_query(cb_id, text="این کانال دیگر وجود ندارد.", show_alert=True)
+                        continue
+
+                    answer_callback_query(cb_id)
                     if cb_msg_id:
                         edit_telegram_admin_message(
                             cb_chat_id, cb_msg_id,
-                            "🗑 <b>حذف کانال:</b>\n\nروی کانالی که قصد حذف آن را دارید کلیک کنید:",
-                            reply_markup=build_channels_delete_keyboard()
+                            f"⚠️ کانال <b>{html.escape(str(channel_cfg.get('name') or channel_cfg.get('id')))}</b> حذف شود؟\n\n"
+                            "تنظیمات اختصاصی پیام این کانال نیز پاک می‌شود.",
+                            reply_markup=build_channel_delete_confirm_keyboard(channel_index)
+                        )
+
+                elif cb_data.startswith("chan_del_do:"):
+                    try:
+                        channel_index = int(cb_data.rsplit(":", 1)[1])
+                        channels = load_channels()
+                        if not 0 <= channel_index < len(channels):
+                            raise IndexError("channel no longer exists")
+                        deleted_channel = channels.pop(channel_index)
+                        save_channels(channels)
+                        set_channel_disabled(deleted_channel.get("id"), True)
+                    except (ValueError, IndexError):
+                        answer_callback_query(cb_id, text="این کانال دیگر وجود ندارد.", show_alert=True)
+                        continue
+
+                    answer_callback_query(cb_id, text="✅ کانال حذف شد.")
+                    if cb_msg_id:
+                        edit_telegram_admin_message(
+                            cb_chat_id, cb_msg_id,
+                            get_channels_text(),
+                            reply_markup=build_channels_keyboard()
                         )
 
                 continue
@@ -1729,24 +1885,35 @@ def process_telegram_admin_commands():
                 continue
 
             if current_action == "wait_team_name" and text:
-                team_name = text.strip()
+                is_valid, team_result = validate_team_name(text)
+                if not is_valid:
+                    send_telegram_admin_message(
+                        chat_id,
+                        f"⚠️ {team_result}\n\nیک نام معتبر بفرستید یا به فهرست تیم‌ها برگردید.",
+                        reply_markup=build_back_keyboard("menu:teams")
+                    )
+                    continue
+
+                team_name = team_result
                 teams = load_target_teams()
                 norm_existing = [normalize_text(t) for t in teams]
                 if normalize_text(team_name) in norm_existing:
                     send_telegram_admin_message(
                         chat_id,
-                        f"⚠️ تیم <b>{team_name}</b> از قبل در لیست وجود دارد.",
-                        reply_markup=build_teams_keyboard()
+                        f"ℹ️ تیم <b>{html.escape(team_name)}</b> از قبل در فهرست وجود دارد.\n\n"
+                        "می‌توانید نام تیم دیگری را بفرستید یا برگردید.",
+                        reply_markup=build_back_keyboard("menu:teams")
                     )
-                else:
-                    teams.append(team_name)
-                    save_target_teams(teams)
-                    send_telegram_admin_message(
-                        chat_id,
-                        f"✅ تیم <b>{team_name}</b> با موفقیت به لیست مانیتورینگ اضافه شد!",
-                        reply_markup=build_teams_keyboard()
-                    )
+                    continue
+
+                teams.append(team_name)
+                save_target_teams(teams)
                 ADMIN_STATE.pop(chat_id, None)
+                send_telegram_admin_message(
+                    chat_id,
+                    f"✅ تیم <b>{html.escape(team_name)}</b> اضافه شد.\n\n" + get_teams_text(),
+                    reply_markup=build_teams_keyboard()
+                )
                 continue
 
             elif current_action == "wait_channel_input":
@@ -1755,6 +1922,9 @@ def process_telegram_admin_commands():
 
                 # Check if message is forwarded from a channel
                 fwd_chat = message.get("forward_from_chat")
+                forward_origin = message.get("forward_origin") or {}
+                if not fwd_chat and forward_origin.get("type") == "channel":
+                    fwd_chat = forward_origin.get("chat")
                 if fwd_chat and fwd_chat.get("type") == "channel":
                     chan_id = str(fwd_chat.get("id"))
                     chan_title = fwd_chat.get("title") or f"کانال {chan_id}"
@@ -1773,6 +1943,18 @@ def process_telegram_admin_commands():
                     )
                     continue
 
+                channels = load_channels()
+                existing_channel = find_channel(channels, chan_id)
+                if existing_channel is not None:
+                    ADMIN_STATE.pop(chat_id, None)
+                    send_telegram_admin_message(
+                        chat_id,
+                        f"ℹ️ کانال <b>{html.escape(str(existing_channel.get('name') or chan_id))}</b> "
+                        "از قبل متصل است.",
+                        reply_markup=build_channels_keyboard()
+                    )
+                    continue
+
                 ADMIN_STATE[chat_id] = {
                     "action": "wait_channel_format",
                     "id": chan_id,
@@ -1781,15 +1963,23 @@ def process_telegram_admin_commands():
 
                 format_pick_kb = {
                     "inline_keyboard": [
-                        [{"text": "⚡️ خیلی کوتاه (فقط نام دو تیم)", "callback_data": "chan_new_fmt:short"}],
-                        [{"text": "📄 کامل با کیفیت‌ها و لینک دانلود", "callback_data": "chan_new_fmt:full"}],
-                        [{"text": "🔕 کامل بدون لینک دانلود", "callback_data": "chan_new_fmt:no_links"}],
-                        [{"text": "❌ انصراف", "callback_data": "menu:channels"}]
+                        [
+                            {"text": "ساده", "callback_data": "chan_new_fmt:short"},
+                            {"text": "بدون دانلود", "callback_data": "chan_new_fmt:no_links"},
+                            {"text": "کامل", "callback_data": "chan_new_fmt:full"}
+                        ],
+                        [{"text": "↩️ انصراف", "callback_data": "menu:channels"}]
                     ]
                 }
                 send_telegram_admin_message(
                     chat_id,
-                    f"✅ کانال <b>{chan_title}</b> (<code>{chan_id}</code>) دریافت شد.\n\n👇 نوع فرمت ارسال برای این کانال را انتخاب کنید:",
+                    f"➕ <b>افزودن کانال</b> · مرحله ۲ از ۲\n\n"
+                    f"کانال: <b>{html.escape(str(chan_title))}</b>\n"
+                    f"شناسه: <code>{html.escape(str(chan_id))}</code>\n\n"
+                    "قالب اولیهٔ پیام را انتخاب کنید؛ بعداً همهٔ اجزا قابل تغییرند:\n"
+                    "• ساده: فقط نام دو تیم\n"
+                    "• بدون دانلود: نتیجه، کیفیت و منبع\n"
+                    "• کامل: همهٔ موارد و لینک‌های دانلود",
                     reply_markup=format_pick_kb
                 )
                 continue
@@ -1817,8 +2007,12 @@ def process_telegram_admin_commands():
                     reply_markup=build_main_dashboard_keyboard()
                 )
 
-        config["last_update_id"] = last_update_id
-        save_config(config)
+        # Merge with settings changed by callbacks during this polling cycle.
+        # Saving the stale snapshot loaded at function start would otherwise
+        # overwrite interval/channel changes made above.
+        latest_config = load_config()
+        latest_config["last_update_id"] = last_update_id
+        save_config(latest_config)
 
     except Exception as e:
         print(f"[-] Error processing telegram admin commands: {e}")
